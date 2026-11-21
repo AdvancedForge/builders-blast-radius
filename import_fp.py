@@ -10,8 +10,15 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import pkgutil
 import sys
+
+
+DEEP = os.environ.get("BR_IMPORT_DEEP", "1") == "1"
+# Deep hashing only for these modules' globals and classes, and classes that
+# inherit from them (where state derived from a change can live); all if unset.
+DEEP_MODULES = set(filter(None, os.environ.get("BR_DEEP_MODULES", "").split(","))) or None
 
 
 def fingerprint():
@@ -70,19 +77,30 @@ def fingerprint():
         elif isinstance(value, dict):
             exprs = [f"{k!r}:{v.sql()}" for k, v in value.items() if isinstance(v, Expr)]
             out[where] = f"keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else "")
-        if isinstance(value, (dict, set, frozenset, list, tuple)):
+        if DEEP and deep_ok[0] and isinstance(value, (dict, set, frozenset, list, tuple)):
             out["deep|" + where] = canon(value)
+
+    deep_ok = [True]
+
+    def related(obj) -> bool:
+        if DEEP_MODULES is None:
+            return True
+        if inspect.isclass(obj):
+            return any(k.__module__ in DEEP_MODULES for k in obj.__mro__)
+        return getattr(obj, "__name__", None) in DEEP_MODULES
 
     seen = set()
     for mod in mods:
         for k, v in sorted(vars(mod).items()):
             if not k.startswith("__"):
+                deep_ok[0] = related(mod)
                 note(f"{mod.__name__}:.{k}", v)
             if inspect.isclass(v) and v.__module__ == mod.__name__ and id(v) not in seen:
                 seen.add(id(v))
                 stack = [v]
                 while stack:
                     c = stack.pop()
+                    deep_ok[0] = related(c)
                     for ck, cv in sorted(vars(c).items()):
                         if not ck.startswith("__"):
                             note(f"{c.__module__}:{c.__qualname__}.{ck}", cv)
@@ -102,6 +120,10 @@ if __name__ == "__main__":
         json.dump(fp, open(path, "w"))
         sys.exit(0)
     base = json.load(open(path))
+    if not DEEP:
+        base = {k: v for k, v in base.items() if not k.startswith("deep|")}
+    elif DEEP_MODULES is not None:
+        base = {k: v for k, v in base.items() if not k.startswith("deep|") or k in fp}
     for k in sorted(set(base) | set(fp)):
         if base.get(k) != fp.get(k):
             print(k)

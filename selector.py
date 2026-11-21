@@ -1073,7 +1073,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
         if data or at_import:
             # Data built at import from the changed attributes (tries, copies
             # under other names) cannot be patched in: it must not differ.
-            changes = import_changes(sel)
+            changes = import_changes(sel, deep=True)
             attrs = {op[1] for _, ops in data for op in ops}
             deep = getattr(sel, "import_deep", None) if changes is not None else None
             if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
@@ -1325,7 +1325,7 @@ def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
 _UNSET = object()
 
 
-def import_changes(sel: "Selector") -> list[str] | None:
+def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
     """Import patched sqlglot, load every dialect and compare the SQL objects
     and dict shapes built at import with the pinned commit. Returns the
     "module:Class.attr" entries that differ, or None if the import fails."""
@@ -1338,10 +1338,13 @@ def import_changes(sel: "Selector") -> list[str] | None:
     if getattr(sel, "_import_result", _UNSET) is not _UNSET:
         return sel._import_result  # already checked for this commit
     sel._import_result = None
+    sel.import_deep = None
     root = Path(tempfile.mkdtemp(prefix="bri", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
-        env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
+                   BR_IMPORT_DEEP="1",
+                   BR_DEEP_MODULES=",".join(module_name(f) for f in set(sel.patched) | sel.deleted if f.endswith(".py")))
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         if r.returncode != 0:
@@ -1400,7 +1403,7 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
             if ops:
                 data.append((module_name(f), ops))
         if data:
-            changes = import_changes(sel)
+            changes = import_changes(sel, deep=True)
             attrs = {op[1] for _, ops in data for op in ops}
             deep = getattr(sel, "import_deep", None) if changes is not None else None
             if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
