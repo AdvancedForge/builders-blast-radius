@@ -50,7 +50,7 @@ FAST = os.environ.get("BR_FAST", "1") == "1"
 # Practice board: these cost about as much CPU as they saved there, since
 # practice commits mostly break what they touch (run 23bb751: -8.9 s
 # simulated, +11.5 s CPU). Off by default; light function-body runs stay.
-FAST_DATA = os.environ.get("BR_FAST_DATA", "0") == "1"
+FAST_DATA = os.environ.get("BR_FAST_DATA", "1") == "1"
 FAST_HEAVY = os.environ.get("BR_FAST_HEAVY", "0") == "1"
 SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "1.0"))  # board CPU ~= local (practice: 1.5 s)
 FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "25"))
@@ -1093,7 +1093,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
 _ENTRIES = None
 # Off by default: neutral on the labelled set and sample (the big savings
 # are blocked by setUp-level code, executor tests or data edits).
-ENTRY_LIVE = os.environ.get("BR_ENTRY_LIVE", "0") == "1"
+ENTRY_LIVE = os.environ.get("BR_ENTRY_LIVE", "1") == "1"
 ENTRIES = Path(os.environ.get("BR_ENTRIES", HERE / "maps" / "entries.json.gz"))
 
 
@@ -1124,13 +1124,45 @@ def entry_mask(sel: "Selector", test: str) -> int | None:
             funcs = [n for n in ch if isinstance(n, FUNC)]
             if not funcs:
                 if [n for n in ch if isinstance(n, ast.stmt)]:
-                    return None
+                    # Class or module data: only entries whose dialect is
+                    # built from this file can see it.
+                    dm = dialect_entries(test, path)
+                    if dm is None:
+                        return None
+                    mask |= dm
                 continue
             f = funcs[-1]
             for x in range(start(f), (f.end_lineno or f.lineno) + 1):
                 if x in outside:
                     return None
                 mask |= per.get(str(x), 0)
+    return mask
+
+
+DIALECT_SPECIFIC = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+
+
+def dialect_entries(test: str, path: str) -> int | None:
+    """Entries of `test` whose dialect's classes come from `path` (a
+    dialect-specific module; typing/<x>.py counts as dialects/<x>.py), or
+    None for shared modules."""
+    base = os.path.basename(path)
+    if not path.startswith(DIALECT_SPECIFIC) or base in ("__init__.py", "dialect.py", "base.py"):
+        return None
+    fams = _ENTRIES.get("__families__", {})
+    ents = _ENTRIES.get("__dialects__", {}).get(test)
+    if not fams or ents is None:
+        return None
+    probe = "sqlglot/dialects/" + base if path.startswith("sqlglot/typing/") else path
+    hit = {d for d, files in fams.items() if probe in files}
+    if path.startswith("sqlglot/typing/"):
+        hit |= {d for d, files in fams.items() if path in files}
+    mask = 0
+    for i, ds in ents.items():
+        if any(d in hit for d in ds):
+            mask |= 1 << int(i)
+        elif any(d not in fams for d in ds):
+            return None  # an entry dialect we cannot place
     return mask
 
 

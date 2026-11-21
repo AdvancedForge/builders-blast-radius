@@ -22,6 +22,13 @@ for path in d.measured_files():
                 t["outside"].setdefault(rel, []).append(ln)
 # keep only tests that have entries
 out = {k: v for k, v in out.items() if v["lines"]}
+import os
+dj = sys.argv[1] + ".dialects.json"
+if os.path.exists(dj):
+    info = json.load(open(dj))
+    out["__dialects__"] = {t: {i: sorted({x.strip() for d in ds for x in d.split(",")}) for i, ds in m.items()}
+                           for t, m in info["entries"].items()}
+    out["__families__"] = info["families"]
 with gzip.open(sys.argv[2], "wt") as fh:
     json.dump(out, fh)
 print(len(out), "tests with entries")

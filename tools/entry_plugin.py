@@ -11,6 +11,7 @@ import coverage
 _cov = coverage.Coverage(data_file=os.environ["ENTRY_COV"], include=["*/sqlglot/*"])
 _node = [None]
 _titles = {}
+_dialects = {}
 
 
 def _rt(o):
@@ -48,6 +49,7 @@ def pytest_configure(config):
         for i, (meta, sql, expected) in enumerate(orig_pairs(filename), start=1):
             title = meta.get("title") or f"{i}, {sql}"
             _titles.setdefault((_node[0], title), []).append(i)
+            _dialects.setdefault(_node[0], {}).setdefault(i, set()).add(meta.get("dialect") or "")
             _cov.switch_context(f"{_node[0]}#{i}")
             yield meta, sql, expected
             _cov.switch_context(_node[0])
@@ -81,3 +83,22 @@ def pytest_runtest_teardown(item):
 def pytest_sessionfinish(session):
     _cov.stop()
     _cov.save()
+    import json
+    # Which dialect each entry uses, and which source files each dialect's
+    # classes (dialect, tokenizer, parser, generator, and their bases) live in.
+    from sqlglot.dialects.dialect import Dialect, Dialects
+    fam = {}
+    for d in [""] + [x.value for x in Dialects]:
+        try:
+            dc = type(Dialect.get_or_raise(d or None))
+        except Exception:
+            continue
+        files = set()
+        for c in (dc, dc.tokenizer_class, dc.parser_class, dc.generator_class):
+            for k in c.__mro__:
+                f = getattr(__import__(k.__module__, fromlist=["x"]), "__file__", "") or ""
+                if "/sqlglot/" in f:
+                    files.add(f[f.rindex("/sqlglot/") + 1:])
+        fam[d] = sorted(files)
+    json.dump({"entries": {n: {str(i): sorted(v) for i, v in m.items()} for n, m in _dialects.items()},
+               "families": fam}, open(os.environ["ENTRY_COV"] + ".dialects.json", "w"))
