@@ -406,8 +406,9 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
             loader = unittest.TestLoader()
             first, second = unittest.TestSuite(), unittest.TestSuite()
             for name in names:
-                (second if names[name].split("::")[0] in (defer or ()) else first).addTests(
-                    loader.loadTestsFromName(name))
+                nid = names[name]
+                later = nid.split("::")[0] in (defer or ()) and nid not in (masks or {})
+                (second if later else first).addTests(loader.loadTestsFromName(name))
             planned = {t.id() for t in _iter(first)}  # unittest empties the suite as it runs
             later = {t.id() for t in _iter(second)}
             result = _Result()
