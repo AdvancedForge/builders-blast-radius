@@ -417,6 +417,36 @@ class Selector:
                 pass
         return out
 
+    @staticmethod
+    def dict_spans(stmt, ln) -> bool:
+        """True if line `ln` of the assignment lies inside a dict literal (the
+        dict-entry path handles those)."""
+        return stmt.value is not None and any(
+            isinstance(n, ast.Dict) and n.lineno <= ln <= (n.end_lineno or n.lineno) for n in ast.walk(stmt.value))
+
+    def mention_reads(self, name: str) -> set[int]:
+        """Tests that ran any sqlglot line naming `name` (definitions in class
+        bodies excluded). Constants are only read by name: the dynamic
+        getattr calls in sqlglot look up *_sql methods."""
+        key = "m:" + name
+        if key in self._reads_cache:
+            return self._reads_cache[key]
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        out: set[int] = set()
+        for rel in self.m.lines:
+            if not rel.startswith("sqlglot/"):
+                continue
+            text = self.text(rel)
+            if text is None or name not in text:
+                continue
+            for i, l in enumerate(self.lines_of(rel), 1):
+                if name in l and pat.search(l) and not l.lstrip().startswith("#"):
+                    if re.match(r"\s*" + re.escape(name) + r"\s*[:=]", l):
+                        continue  # a definition or override
+                    out |= self.m.line(rel, i)
+        self._reads_cache[key] = out
+        return out
+
     def runtime_reads(self, name: str) -> set[int] | None:
         """Tests that ran a line reading attribute/name `name`, or None if any
         read happens outside a function (class creation, module import), where
@@ -569,6 +599,12 @@ class Selector:
                 reads = [self.runtime_reads(n) for n in names] if names else [None]
                 if all(r is not None for r in reads):
                     return users & set().union(*reads)
+                if names and not self.dict_spans(stmt, ln):
+                    # Also read while modules load: tests that ran a line naming
+                    # it, plus whatever the import check finds derived from it.
+                    self.needs_import_check = True
+                    self.narrowed_attrs |= names
+                    return users & set().union(*(self.mention_reads(n) for n in names))
             ku = self.entry_key_users(path, tree, ch, ln, self.lines_of(path))
             if ku is not None:
                 return users & ku
@@ -800,9 +836,14 @@ class Selector:
                         users = users & set().union(*(self.exp_users(x) for x in keys))
                     elif isinstance(member, (ast.Assign, ast.AnnAssign)) and not any(
                             isinstance(x, ast.Dict) for x in nch[ci + 2:]):
-                        reads = [self.runtime_reads(x) for x in self.assigned(member)] or [None]
+                        names_m = self.assigned(member)
+                        reads = [self.runtime_reads(x) for x in names_m] or [None]
                         if all(r is not None for r in reads):
                             users = users & set().union(*reads)
+                        elif names_m:
+                            self.needs_import_check = True
+                            self.narrowed_attrs |= names_m
+                            users = users & set().union(*(self.mention_reads(x) for x in names_m))
                     out |= users
         if ci is None and not any(isinstance(x, FUNC) for x in nch):
             stmt = nstmts[-1]
