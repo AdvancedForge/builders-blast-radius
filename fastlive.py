@@ -792,7 +792,7 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
             os.waitpid(pid, 0)
             os.close(r)
             return None
-        time.sleep(0.002)
+        time.sleep(0.02)
     data = b""
     while True:
         chunk = os.read(r, 65536)
