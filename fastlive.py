@@ -419,6 +419,16 @@ def _apply_ops(module, ops):
             _method_op(module, cls, attr, op, vsrc)
             continue
         if op == "set":
+            stack, seen = list(cls.__subclasses__()), set()
+            while stack:
+                sc = stack.pop()
+                if id(sc) in seen:
+                    continue
+                seen.add(id(sc))
+                stack.extend(sc.__subclasses__())
+                if attr in sc.__dict__:
+                    # a subclass value may be built from this one ({*Parent.X, ...})
+                    raise RuntimeError(f"{sc.__qualname__} redefines {attr}")
             setattr(cls, attr, eval(vsrc, ns))
             continue
         d = cls.__dict__.get(attr)
@@ -522,8 +532,8 @@ def swaps_for(rel: str, old_text: str, new_text: str, allow_bodies: bool = False
         oc, nc = a[i][0], b[pair_of[i]][0]
         funcs = live.get((path, oc.co_qualname, oc.co_firstlineno), [])
         for f in funcs:
-            if len(f.__code__.co_freevars) != len(nc.co_freevars):
-                return None
+            if f.__code__.co_freevars != nc.co_freevars:
+                return None  # closure cells are bound by name at creation
         out.append((funcs, nc))
     return out
 

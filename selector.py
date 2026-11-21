@@ -353,6 +353,23 @@ def module_name(path: str) -> str:
 EXP_NAME = re.compile(r"\bexp\.([A-Z]\w*)")
 
 
+# Functions that run once per process (lazily built caches, dialect loading):
+# the map credits them only to whichever tests happened to trigger them first.
+ONCE_PER_PROCESS = {
+    ("sqlglot/generator.py", "_build_dispatch"),
+    ("sqlglot/dialects/__init__.py", "__getattr__"),
+    ("sqlglot/optimizer/simplify.py", "_build_gen_dispatch"),
+}
+ONCE_PER_PROCESS_CLASSES = {("sqlglot/dialects/dialect.py", "_Dialect")}
+
+
+def once_per_process(path: str, ch: list) -> bool:
+    names = [n.name for n in ch if isinstance(n, FUNC)]
+    classes = [n.name for n in ch if isinstance(n, ast.ClassDef)]
+    return any((path, f) in ONCE_PER_PROCESS for f in names) or \
+        any((path, c) in ONCE_PER_PROCESS_CLASSES for c in classes)
+
+
 class Selector:
     def __init__(self, m: Map):
         self.m = m
@@ -421,6 +438,67 @@ class Selector:
                 # a key no traced expression has: could still be dispatched for
                 # an expression built only outside the suite's traces
                 pass
+        return out
+
+    def fixture_loads_same(self, fp: FilePatch, p: str) -> bool:
+        if not p.endswith(".sql") or fp.old != fp.new:
+            return False
+        old = self.text(p)
+        if old is None:
+            return False
+        new = apply(old, fp)[0]
+        a, b = fixture_pairs(old), fixture_pairs(new)
+        if len(a) != len(b):
+            return False
+        for sql, _ in b:
+            for line in sql.split("\n"):
+                if line.startswith("#") and ":" not in line:
+                    return False  # _extract_meta would raise in setUpClass
+        return True
+
+    def mentioning_tests(self, path: str) -> set[int]:
+        """Test files whose source mentions the file or its directory."""
+        out: set[int] = set()
+        names = {os.path.basename(path), os.path.basename(os.path.dirname(path))} - {""}
+        for tf in self.m.closure:
+            t = self.text(tf) or ""
+            if any(n in t for n in names):
+                out |= self.m.prefix(tf + "::")
+        return out
+
+    def new_file(self, path: str) -> set[int]:
+        """A new .py file. Shadowing an existing module or package breaks its
+        importers; any new sqlglot module joins the package (pkgutil walks,
+        sqlglotc's package list, typing's redundancy test)."""
+        base = path[:-3]
+        stem = base.removesuffix("/__init__")
+        shadows = [stem + ".py", stem + "/__init__.py"]
+        if any((SRC / x).is_file() and x != path for x in shadows) or os.path.basename(path) == "conftest.py":
+            raise Everything(f"new file shadows a module: {path}")
+        out: set[int] = set()
+        if path.startswith("sqlglot/"):
+            self.needs_import_check = True
+            out |= self.m.prefix("tests/test_sqlglotc.py::")
+            if path.startswith("sqlglot/typing/"):
+                out |= self.m.prefix("tests/test_typing.py::")
+        return out
+
+    def import_time_users(self, path: str) -> set[int]:
+        """Everything that imports `path` or a module importing it, plus the
+        users of every class those modules define."""
+        global _REVDEPS
+        if _REVDEPS is None:
+            try:
+                _REVDEPS = json.load(open(HERE / "revdeps.json"))
+            except OSError:
+                _REVDEPS = {}
+        mod = module_name(path)
+        mods = {mod} | set(_REVDEPS.get(mod, ()))
+        out: set[int] = set()
+        for mname in mods:
+            for rel in (mname.replace(".", "/") + ".py", mname.replace(".", "/") + "/__init__.py"):
+                if rel in self.m.lines:
+                    out |= self.m.importers(rel)
         return out
 
     def typing_metadata_users(self, path: str, old_text: str, new_text: str) -> set[int] | None:
@@ -650,7 +728,8 @@ class Selector:
                 return m.span(path, f.lineno, f.end_lineno) | m.span(path, start(f), f.lineno)
             inner = [n for n in ch[inner_fn + 1:] if isinstance(n, ast.stmt)]
             imported = m.import_lines.get(path, ())
-            if not names_hint and path.startswith("sqlglot/") and imported and not self.import_ok:
+            if not names_hint and path.startswith("sqlglot/") and (imported or once_per_process(path, ch)) \
+                    and not self.import_ok:
                 # The changed statement, or a block header around it, runs while
                 # sqlglot is imported: breaking it can break every import.
                 spots = {ln}
@@ -661,8 +740,13 @@ class Selector:
                 for n in inner:
                     if isinstance(n, COMPOUND):
                         spots.update(range(n.lineno, header_end(n) + 1))
-                if spots & imported:
-                    raise Everything(f"import-time code {path}:{ln}")
+                if spots & imported or once_per_process(path, ch):
+                    # Runs while sqlglot imports (factories, decorators, metaclasses)
+                    # or once per process (lazy caches): coverage cannot say who
+                    # depends on it and a live child cannot re-run it.
+                    self.no_live = True
+                    self.needs_import_check = True
+                    return self.import_time_users(path)
             for n in inner:
                 if isinstance(n, COMPOUND) or isinstance(n, FUNC + (ast.ClassDef,)):
                     out |= m.span(path, n.lineno, max(n.lineno, header_end(n)))
@@ -706,7 +790,7 @@ class Selector:
                     return users & set().union(*(self.mention_reads(n) for n in names))
             ku = self.entry_key_users(path, tree, ch, ln, self.lines_of(path))
             if ku is not None:
-                return users & ku
+                return users & ku  # users include Dialect["x"] lookups (map records them)
             keys = self.dict_keys(path, ch, ln) | extra_names
             if keys:
                 narrowed: set[int] = set()
@@ -847,11 +931,21 @@ class Selector:
                 raise Everything(f"syntax error in {path}")  # dialects load lazily from everywhere
             return m.importers(path) if fp.old else set()
         if not fp.old or old_text == "":
-            return set()  # a new module nothing imports yet
+            return self.new_file(path)
         old_tree = self.tree(fp.old)
+        extra: set[int] = set()
+        if path.startswith("sqlglot/typing/"):
+            # test_typing inspects the metadata itself (e.g. redundant entries)
+            extra = self.m.prefix("tests/test_typing.py::")
+        old_head, new_head = old_text.split("\n")[:2], new_text.split("\n")[:2]
+        if old_head != new_head and any(re.match(r"^[ \t\f]*#.*?coding[:=]", l) for l in old_head + new_head):
+            # a source encoding declaration changes how the whole file decodes
+            if path.startswith("sqlglot/"):
+                raise Everything(f"coding cookie changed: {path}")
+            return m.importers(path)
         typing_users = self.typing_metadata_users(path, old_text, new_text)
         if typing_users is not None:
-            return typing_users
+            return typing_users | extra
         old_lines = old_text.split("\n")
         new_lines = new_text.split("\n")
         # The whole-module comparison (docstrings, == None) costs two parses
@@ -866,7 +960,7 @@ class Selector:
 
         old_lines = old_text.split("\n")
         new_lines = new_text.split("\n")
-        out: set[int] = set()
+        out: set[int] = set(extra)
         for ln in removed:
             code = old_lines[ln - 1].strip()
             if (not code or code.startswith("#")) and not in_string(old_tree, ln):
@@ -996,9 +1090,10 @@ class Selector:
             if idx is not None:
                 readers = m.s(idx)
                 # The executor's setUpClass loads both TPC sets for the whole
-                # class; only the tests named for a set use it.
+                # class; only the tests named for a set use them, provided the
+                # patched fixture still loads (same entries, valid metadata).
                 for marker, tag in (("tpc-h", "tpch"), ("tpc-ds", "tpcds")):
-                    if f"/{marker}/" in p:
+                    if f"/{marker}/" in p and self.fixture_loads_same(fp, p):
                         readers = {k for k in readers if not m.tests[k].startswith("tests/test_executor.py::")
                                    or m.tests[k].endswith(tag) or m.tests[k].rsplit("_", 1)[-1] == tag}
                 self.locs.append(readers)
@@ -1018,6 +1113,7 @@ class Selector:
         self.deleted: set[str] = set()
         self.touched: dict[str, set[int]] = {}
         self.needs_import_check = False
+        self.no_live = False
         self._import_result = _UNSET
         self.import_deep = None
         self.narrowed_attrs: set[str] = set()
@@ -1037,8 +1133,16 @@ class Selector:
                 if path.endswith(".py") or "pytest" in patch_text:
                     raise Everything(path)
                 continue
+            if path.startswith("sqlglotc/") or path in ("pyproject.toml", "setup.py", "MANIFEST.in"):
+                out |= self.m.prefix("tests/test_sqlglotc.py::")  # it runs sqlglotc/setup.py
+                if path == "pyproject.toml" and "pytest" in patch_text:
+                    raise Everything(path)
+                continue
             if path.endswith(".py"):
                 if not (path.startswith("sqlglot/") or path.startswith("tests/")):
+                    if os.path.basename(path) == "sitecustomize.py" or os.path.basename(path) == "conftest.py":
+                        raise Everything(path)
+                    out |= self.mentioning_tests(path)
                     continue
                 out |= self.python_file(fp)
             else:
@@ -1733,7 +1837,11 @@ def main() -> None:
         commit = patch.stem
         _c0 = _cpu()
         try:
-            text = patch.read_text("utf-8", errors="replace")
+            raw = patch.read_bytes()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise Everything("patch is not valid UTF-8")  # Python would reject such source
             sel.import_ok = False
             try:
                 keys = sel.commit(text)
@@ -1770,18 +1878,28 @@ def main() -> None:
                     if passed is not None and m.tests[p] in passed:
                         keys -= {p, *xs}
             tp = next((k for k in keys if m.tests[k] == TPCDS_EXEC), None)
+            if tp is not None:
+                # Dropping it only pays if it is what makes a worker busy: with
+                # another heavier-than-live test listed (test_max_nodes) the
+                # saving is capped at a worker (2 s), less than the check costs.
+                sel_tests = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
+                full = pack_cost([(t["number"], t["seconds"]) for t in sel_tests])
+                rest = pack_cost([(t["number"], t["seconds"]) for t in sel_tests if t["id"] != TPCDS_EXEC])
+                if full - rest < 2.5:
+                    tp = None
             if FP_ON and tp is not None and live_allowed():
                 files = set(sel.patched) | sel.deleted
                 diff = fingerprint_diff(sel, files)
                 if diff == []:
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
-                elif diff is not None and len(diff) <= DIFF_MAX and tpcds_queries_pass(sel, commit, diff):
+                elif diff is not None and len(diff) <= DIFF_MAX and not sel.no_live \
+                        and tpcds_queries_pass(sel, commit, diff):
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS {len(diff)} changed queries pass for real, dropping {TPCDS_EXEC}")
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
-            if FAST and chosen and live_allowed():
+            if FAST and chosen and live_allowed() and not sel.no_live:
                 if all(f.startswith("tests/fixtures/") for f in set(sel.patched) | sel.deleted):
                     chosen = fixture_live(sel, m, commit, chosen)
                 else:

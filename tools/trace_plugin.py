@@ -152,6 +152,45 @@ def pytest_configure(config):
     for c in seen:
         if "__init__" in c.__dict__:
             _wrap_init(c)
+    _wrap_dialect_lookups(Dialect)
+
+
+def _record_dialect_class(cls):
+    """A dialect used without an instance (Dialect["x"].format_time): count
+    the test as a user of the dialect and its tokenizer/parser/generator."""
+    key = _key[0] or _stack_test_file()
+    bucket = _types.setdefault(key, set())
+    for c in (cls, getattr(cls, "tokenizer_class", None), getattr(cls, "parser_class", None),
+              getattr(cls, "generator_class", None)):
+        if isinstance(c, type):
+            bucket.add(c)
+
+
+def _wrap_dialect_lookups(Dialect):
+    meta = type(Dialect)
+    for name in ("__getitem__", "get"):
+        orig = meta.__dict__.get(name)
+        if orig is None:
+            continue
+
+        def make(orig):
+            is_cm = isinstance(orig, classmethod)
+            fn = orig.__func__ if is_cm else orig
+
+            def wrapper(cls, *a, **kw):
+                res = fn(cls, *a, **kw)
+                if isinstance(res, type):
+                    _record_dialect_class(res)
+                return res
+            return classmethod(wrapper) if is_cm else wrapper
+        setattr(meta, name, make(orig))
+    orig_gor = Dialect.__dict__["get_or_raise"].__func__
+
+    def get_or_raise(cls, *a, **kw):
+        res = orig_gor(cls, *a, **kw)
+        _record_dialect_class(res if isinstance(res, type) else type(res))
+        return res
+    Dialect.get_or_raise = classmethod(get_or_raise)
 
 
 def _dump_types():
