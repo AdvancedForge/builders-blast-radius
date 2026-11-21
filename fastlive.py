@@ -356,28 +356,26 @@ def _to_unittest(node_id: str) -> str:
 
 
 def _restrict_entries(masks: dict[str, int]) -> None:
-    """In the child: make TestOptimizer.check_file see only the fixture
-    entries in its test's mask (entries numbered from 1 per file)."""
+    """In the child: fixture loops in TestOptimizer tests (check_file or their
+    own loops over load_sql_fixture_pairs) see only the entries in the
+    running test's mask (entries numbered from 1 per file)."""
     import tests.test_optimizer as TO
 
     cur = [None]
-    orig_cf = TO.TestOptimizer.check_file
+    orig_setup = TO.TestOptimizer.setUp
     orig_pairs = TO.load_sql_fixture_pairs
 
-    def check_file(self, *a, **kw):
+    def setUp(self):
         _, cls, meth = self.id().rsplit(".", 2)
         cur[0] = masks.get(f"tests/test_optimizer.py::{cls}::{meth}")
-        try:
-            return orig_cf(self, *a, **kw)
-        finally:
-            cur[0] = None
+        return orig_setup(self)
 
     def pairs(filename):
         for i, item in enumerate(orig_pairs(filename), start=1):
             if cur[0] is None or cur[0] >> i & 1:
                 yield item
 
-    TO.TestOptimizer.check_file = check_file
+    TO.TestOptimizer.setUp = setUp
     TO.load_sql_fixture_pairs = pairs
 
 
