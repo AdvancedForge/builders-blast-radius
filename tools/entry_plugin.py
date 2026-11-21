@@ -69,6 +69,16 @@ def pytest_configure(config):
             _cov.switch_context(_node[0])
 
     T.TestOptimizer.subTest = subtest
+    orig_setup = T.TestOptimizer.setUp
+
+    def setUp(self):
+        _cov.switch_context(f"{_node[0]}@setup")
+        try:
+            return orig_setup(self)
+        finally:
+            _cov.switch_context(_node[0])
+
+    T.TestOptimizer.setUp = setUp
 
 
 def pytest_runtest_call(item):

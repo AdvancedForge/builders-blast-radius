@@ -11,8 +11,12 @@ for path in d.measured_files():
             if not c:
                 continue
             node, _, ent = c.partition("#")
-            t = out.setdefault(node, {"lines": {}, "outside": {}})
-            if ent:
+            setup = node.endswith("@setup")
+            node = node.removesuffix("@setup")
+            t = out.setdefault(node, {"lines": {}, "outside": {}, "setup": {}})
+            if setup:
+                t["setup"].setdefault(rel, []).append(ln)
+            elif ent:
                 mask = 0
                 for i in ent.split("+"):
                     mask |= 1 << int(i)

@@ -1145,11 +1145,67 @@ def entry_mask(sel: "Selector", test: str) -> int | None:
                     mask |= dm
                 continue
             f = funcs[-1]
-            for x in range(start(f), (f.end_lineno or f.lineno) + 1):
-                if x in outside:
-                    return None
+            span = range(start(f), (f.end_lineno or f.lineno) + 1)
+            if any(x in outside for x in span) and not data_pure_test(sel, test):
+                return None  # outside code may compute data the entries consume
+            for x in span:
                 mask |= per.get(str(x), 0)
     return mask
+
+
+_PURE: dict[str, bool] = {}
+
+
+def data_pure_test(sel: "Selector", test: str) -> bool:
+    """True if a check_file-style test passes only literal data into its
+    fixture entries: every local assignment in its body is a literal and
+    every check_file argument is a literal, such a local, or a reference
+    (e.g. optimizer.optimize). Its other code then runs in full in a scoped
+    run and cannot change what unaffected entries compute."""
+    if test in _PURE:
+        return _PURE[test]
+    ok = False
+    try:
+        rel, cls, meth = test.split("::")
+        tree = sel.tree(rel)
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == cls)
+        fn = next(n for n in node.body if isinstance(n, FUNC) and n.name == meth)
+
+        def literal(e) -> bool:
+            try:
+                ast.literal_eval(e)
+                return True
+            except Exception:  # noqa: BLE001
+                return False
+
+        locals_ok = set()
+        ok = True
+        for n in ast.walk(fn):
+            if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None:
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                if all(isinstance(t, ast.Name) for t in targets) and literal(n.value):
+                    locals_ok |= {t.id for t in targets}
+                elif any(isinstance(t, ast.Name) for t in targets):
+                    # a computed local: fine only if not passed to check_file
+                    pass
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "check_file":
+                for a in list(n.args) + [k.value for k in n.keywords]:
+                    if not (literal(a) or isinstance(a, ast.Attribute)
+                            or (isinstance(a, ast.Name) and a.id in locals_ok)):
+                        ok = False
+        # Own fixture loops (no check_file): every local read in the loop
+        # body that is assigned before it must be a literal.
+        for n in ast.walk(fn):
+            if isinstance(n, ast.For) and "load_sql_fixture" in ast.dump(n.iter):
+                assigned_before = {t.id for st in fn.body if st.lineno < n.lineno and isinstance(st, ast.Assign)
+                                   for t in st.targets if isinstance(t, ast.Name)}
+                used = {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}
+                if (used & assigned_before) - locals_ok:
+                    ok = False
+    except Exception:  # noqa: BLE001
+        ok = False
+    _PURE[test] = ok
+    return ok
 
 
 DIALECT_SPECIFIC = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
