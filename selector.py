@@ -2134,6 +2134,50 @@ def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str])
 # ------------------------------------------------------------------------ output
 
 
+MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+
+
+def diag_mark(workers: list[list[int]], chosen: list[dict], all_tests: list[dict]) -> list[list[int]]:
+    """DIAGNOSTIC build: same selection, plus marker tests in the busiest
+    worker whose durations sum to a code, so the board's exact simulated
+    total counts expensive commits by shape. Adding tests cannot miss.
+    1 ms: lists test_max_nodes; 31 ms: lists test_execute_tpcds (and not
+    max_nodes); 961 ms: neither, but costs >= 8 s."""
+    if not workers:
+        return workers
+    ms = {t["number"]: round(t["seconds"] * 1000) for t in all_tests}
+    ids = {t["id"] for t in chosen}
+    loads = [sum(ms[n] for n in w) for w in workers]
+    cost = max(loads) + 2000 * len(workers)
+    if MAX_NODES in ids:
+        code = 1
+    elif TPCDS_EXEC in ids:
+        code = 31
+    elif cost >= 8000:
+        code = 961
+    else:
+        return workers
+    used = {n for w in workers for n in w}
+    # Exact subset sum over unused tests (small durations first).
+    cand = sorted(((ms[t["number"]], t["number"]) for t in all_tests
+                   if t["number"] not in used and 0 < ms[t["number"]] <= code), key=lambda x: (-x[0], x[1]))
+    reach = {0: []}
+    for d, n in cand:
+        for tot, picked in list(reach.items()):
+            if tot + d <= code and tot + d not in reach:
+                reach[tot + d] = picked + [n]
+        if code in reach:
+            break
+    if code not in reach:
+        log(f"diag: no exact marker for {code}")
+        return workers
+    i = loads.index(max(loads))
+    workers = [list(w) for w in workers]
+    workers[i] += reach[code]
+    log(f"diag: code {code}")
+    return workers
+
+
 def pack(tests: list[tuple[int, float]]) -> list[list[int]]:
     if not tests:
         return []
@@ -2290,6 +2334,7 @@ def main() -> None:
             log(f"{commit}: error {type(e).__name__}: {e}; selecting everything")
             chosen = every
         workers = pack([(t["number"], t["seconds"]) for t in chosen])
+        workers = diag_mark(workers, chosen, every)
         print(json.dumps({"commit": commit, "workers": workers}), flush=True)
         log(f"{commit}: commit cpu {_cpu() - _c0:.2f}")
         log(f"{commit}: {len(chosen)} tests, {len(workers)} workers")
