@@ -1034,6 +1034,12 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
         by[t["file"]] = by.get(t["file"], 0.0) + sec
     opt = by.pop("tests/test_optimizer.py", 0.0)
     exe = by.pop("tests/test_executor.py", 0.0)
+    mem_dialects = affected_dialects(sel) if any(t["id"] == MEMORY_TEST for t in live) else None
+    if mem_dialects is not None:
+        fams = families()
+        full = by.get("tests/test_generator.py", 0.0)
+        mem = next(t["seconds"] for t in live if t["id"] == MEMORY_TEST)
+        by["tests/test_generator.py"] = full - mem + mem * max(len(mem_dialects), 1) / max(len(fams), 1)
     est = 0.03 + 0.55 * sum(by.values()) + 1.4 * opt + 0.8 * exe + (1.0 if exe else 0.0)
     import sys as _sys
     for f, mod in (("tests/test_optimizer.py", "tests.test_optimizer"), ("tests/test_executor.py", "tests.test_executor")):
@@ -1085,7 +1091,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             return chosen
         c_imp = resource.getrusage(resource.RUSAGE_SELF)
         passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data, defer=HEAVY_TEST_FILES,
-                              masks=masks)
+                              masks=masks, dialects=mem_dialects)
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
         return chosen
@@ -1215,6 +1221,54 @@ def data_pure_test(sel: "Selector", test: str) -> bool:
 DIALECT_SPECIFIC = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
 
 
+_FAMILIES: dict[str, set[str]] | None = None
+
+
+def families() -> dict[str, set[str]]:
+    """Dialect -> files its behaviour can come from: the files of its classes
+    (from the map) plus every dialect-specific module those files import,
+    transitively (dialects compose others: Athena uses Hive and Trino)."""
+    global _FAMILIES
+    if _FAMILIES is not None:
+        return _FAMILIES
+    base = (_ENTRIES or {}).get("__families__", {})
+    imports: dict[str, set[str]] = {}
+
+    def deps(rel: str) -> set[str]:
+        if rel in imports:
+            return imports[rel]
+        imports[rel] = set()
+        try:
+            tree = ast.parse((SRC / rel).read_text("utf-8"))
+        except (OSError, SyntaxError):
+            return imports[rel]
+        found = set()
+        for n in ast.walk(tree):
+            mods = []
+            if isinstance(n, ast.ImportFrom) and n.module and n.module.startswith("sqlglot"):
+                mods = [n.module] + [f"{n.module}.{a.name}" for a in n.names]
+            elif isinstance(n, ast.Import):
+                mods = [a.name for a in n.names if a.name.startswith("sqlglot")]
+            for mname in mods:
+                for cand in (mname.replace(".", "/") + ".py", mname.replace(".", "/") + "/__init__.py"):
+                    if (SRC / cand).is_file() and cand.startswith(DIALECT_SPECIFIC) \
+                            and os.path.basename(cand) not in ("__init__.py", "dialect.py", "base.py"):
+                        found.add(cand)
+        imports[rel] = found
+        for f in list(found):
+            imports[rel] |= deps(f)
+        return imports[rel]
+
+    out = {}
+    for d, files in base.items():
+        fam = set(files)
+        for f in list(files):
+            fam |= deps(f)
+        out[d] = fam
+    _FAMILIES = out
+    return out
+
+
 def dialect_entries(test: str, path: str) -> int | None:
     """Entries of `test` whose dialect's classes come from `path` (a
     dialect-specific module; typing/<x>.py counts as dialects/<x>.py), or
@@ -1222,7 +1276,7 @@ def dialect_entries(test: str, path: str) -> int | None:
     base = os.path.basename(path)
     if not path.startswith(DIALECT_SPECIFIC) or base in ("__init__.py", "dialect.py", "base.py"):
         return None
-    fams = _ENTRIES.get("__families__", {})
+    fams = families()
     ents = _ENTRIES.get("__dialects__", {}).get(test)
     if not fams or ents is None:
         return None
@@ -1237,6 +1291,29 @@ def dialect_entries(test: str, path: str) -> int | None:
         elif any(d not in fams for d in ds):
             return None  # an entry dialect we cannot place
     return mask
+
+
+MEMORY_TEST = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+
+def affected_dialects(sel: "Selector") -> list[str] | None:
+    """Dialects (Dialects values) built from the changed files, or None when a
+    change is in shared code (every dialect)."""
+    if _ENTRIES is None:
+        entry_mask(sel, "")  # loads the map
+    fams = families() if _ENTRIES else {}
+    if not fams or not sel.touched:
+        return None
+    hit: set[str] = set()
+    for path in set(sel.patched) | sel.deleted:
+        if not path.endswith(".py"):
+            continue
+        base = os.path.basename(path)
+        if not path.startswith(DIALECT_SPECIFIC) or base in ("__init__.py", "dialect.py", "base.py"):
+            return None
+        probe = "sqlglot/dialects/" + base if path.startswith("sqlglot/typing/") else path
+        hit |= {d for d, files in fams.items() if probe in files or path in files}
+    return sorted(hit)
 
 
 def class_data_change(sel: "Selector", files: set[str]) -> bool:

@@ -511,6 +511,13 @@ def _patch_fixtures(texts: dict[str, str]) -> None:
     H.open = fixture_open
 
 
+def _restrict_dialects(values: list[str]) -> None:
+    """In the child: test_generator's per-dialect loops cover only these."""
+    import tests.test_generator as TG
+
+    TG.Dialects = [d for d in TG.Dialects if d.value in set(values)]
+
+
 def _restrict_tpcds(queries: list[int]) -> None:
     """In the child: TestExecutor's TPC-DS test runs only these queries
     (indices among the queries it executes, as tpc_fp numbers them)."""
@@ -528,7 +535,8 @@ def _restrict_tpcds(queries: list[int]) -> None:
 
 def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
         defer: set[str] | None = None, masks: dict[str, int] | None = None,
-        tpcds: list[int] | None = None, fixtures: dict[str, str] | None = None) -> set[str] | None:
+        tpcds: list[int] | None = None, fixtures: dict[str, str] | None = None,
+        dialects: list[str] | None = None) -> set[str] | None:
     """Fork, apply swaps, run the tests; return the node ids that passed."""
     names = {_to_unittest(n): n for n in node_ids}
     r, w = os.pipe()
@@ -553,6 +561,8 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
                 _restrict_entries(masks)
             if tpcds is not None:
                 _restrict_tpcds(tpcds)
+            if dialects is not None:
+                _restrict_dialects(dialects)
             loader = unittest.TestLoader()
             first, second = unittest.TestSuite(), unittest.TestSuite()
             for name in names:
