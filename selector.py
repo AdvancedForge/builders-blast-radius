@@ -798,6 +798,15 @@ class Selector:
             return set()  # blank or comment
         if is_bare_string(nstmts[-1]):
             return set()  # inside a docstring: no effect at runtime
+        if path.startswith("tests/"):
+            # A brand-new test_* method in a test class: not in tests.json, and
+            # a new name cannot change what the existing tests run.
+            ci = max((i for i, x in enumerate(nch) if isinstance(x, ast.ClassDef)), default=None)
+            if ci is not None and ci + 1 < len(nch) and isinstance(nch[ci + 1], FUNC) \
+                    and nch[ci + 1].name.startswith("test") \
+                    and not self.has_method(old_tree, [x.name for x in nch[:ci + 1] if isinstance(x, ast.ClassDef)],
+                                            nch[ci + 1].name):
+                return set()
         # Old neighbours that are code: the statement just before and just after.
         # A line that replaces a removed one needs none: the removed line's own
         # analysis covers the statement it was part of.
