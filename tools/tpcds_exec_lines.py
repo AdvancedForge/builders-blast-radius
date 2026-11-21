@@ -19,6 +19,33 @@ import tests.test_executor as TE  # noqa: E402
 from sqlglot import parse_one  # noqa: E402
 from tests.helpers import TPCDS_SCHEMA  # noqa: E402
 
+import sqlglot.executor.python as PX  # noqa: E402
+
+# Names each query's generated code looks up (identifiers and string
+# constants, e.g. the comparison a subquery passes by name): which ENV
+# entries a query can reach.
+NAMES: dict = {}
+_gen = PX.PythonExecutor.generate
+
+
+def _names(code, out):
+    out.update(code.co_names)
+    for c in code.co_consts:
+        if isinstance(c, str):
+            out.add(c)
+        elif hasattr(c, "co_names"):
+            _names(c, out)
+
+
+def _generate(self, expression):
+    code = _gen(self, expression)
+    if code is not None:
+        _names(code, NAMES.setdefault(q, set()))
+    return code
+
+
+PX.PythonExecutor.generate = _generate
+q = -1
 TE.TestExecutor.setUpClass()
 cls = TE.TestExecutor
 tables = pickle.loads(pickle.dumps(cls.tpcds_tables))  # what the spawned pool receives
@@ -72,6 +99,12 @@ for f in data.measured_files():
         if mask:
             per[str(ln)] = mask
     out[rel] = per
+names = {}
+for qq, ns in NAMES.items():
+    if qq < 0:  # generated outside a query: every query may depend on it
+        qq = None
+    for x in ns:
+        names[x] = names.get(x, 0) | (everything if qq is None else 1 << qq)
 with gzip.open(sys.argv[1], "wt") as fh:
-    json.dump({"queries": n, "lines": out}, fh)
-print("queries", n, "files", len(out))
+    json.dump({"queries": n, "lines": out, "names": names}, fh)
+print("queries", n, "files", len(out), "names", len(names), "unnamed queries", [i for i in range(n) if i not in NAMES])

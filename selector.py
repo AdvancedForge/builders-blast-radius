@@ -1826,15 +1826,176 @@ TPCDS_EXEC_LINES = Path(os.environ.get("BR_TPCDS_EXEC_LINES", HERE / "maps" / "t
 _tpcds_exec = None
 
 
+ENV_FILE = "sqlglot/executor/env.py"
+TPCDS_TEST_FILE = "tests/test_executor.py"
+
+
 def executor_only(files: set[str]) -> bool:
-    return bool(files) and all(f.startswith("sqlglot/executor/") and f.endswith(".py") for f in files)
+    """Executor code, plus test modules (judged by tpcds_test_untouched)."""
+    return any(f.startswith("sqlglot/executor/") for f in files) and all(
+        f.endswith(".py") and (f.startswith("sqlglot/executor/") or
+                               (f.startswith("tests/") and f.rsplit("/", 1)[-1].startswith("test_")))
+        for f in files)
 
 
-def exec_tpcds_queries(sel: "Selector") -> list[int] | None:
+def tpcds_test_untouched(path: str, old: str, new: str) -> bool:
+    """A test-module edit test_execute_tpcds cannot see: another test module,
+    or in tests/test_executor.py only test_* methods of TestExecutor other
+    than test_execute_tpcds (unittest alone calls them)."""
+    if path.startswith("tests/fixtures/") or not path.startswith("tests/") or \
+            not path.rsplit("/", 1)[-1].startswith("test_") or not path.endswith(".py"):
+        return False
+    if path != TPCDS_TEST_FILE:
+        return True
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return False
+
+    def split(t):
+        mod, cls = [], None
+        for x in t.body:
+            if isinstance(x, ast.ClassDef) and x.name == "TestExecutor" and cls is None:
+                cls = x
+                mod.append("TestExecutor")
+            else:
+                mod.append(ast.dump(x))
+        if cls is None:
+            return None
+        frame = [ast.dump(y) for y in cls.bases + cls.keywords + cls.decorator_list]
+        members = [ast.dump(y) for y in cls.body
+                   if not (isinstance(y, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and y.name.startswith("test_") and y.name != "test_execute_tpcds")]
+        return mod, frame, members
+
+    sa, sb = split(a), split(b)
+    return sa is not None and sa == sb
+
+
+def _pure_def(f: ast.AST, module_vars: set[str]) -> bool:
+    """Calling it changes no state outside the objects it creates."""
+    for n in ast.walk(f):
+        if isinstance(n, (ast.Global, ast.Nonlocal, ast.Delete, ast.Yield, ast.YieldFrom, ast.Await)):
+            return False
+        if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            if not all(isinstance(t, ast.Name) for t in targets):
+                return False
+        if isinstance(n, ast.NamedExpr):
+            return False
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            base = n.func.value
+            while isinstance(base, ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name) and base.id in module_vars:
+                return False  # e.g. REGISTRY.append(...)
+    return True
+
+
+def _import_time_pure(v: ast.AST, funcs: dict, module_vars: set[str]) -> bool:
+    """What evaluating `v` at import does is build function objects: lambdas
+    (only their defaults run), names, attributes, constants, conditionals,
+    and calls of pure functions defined in the module."""
+    if isinstance(v, ast.Lambda):
+        a = v.args
+        return all(_import_time_pure(d, funcs, module_vars) for d in a.defaults + [d for d in a.kw_defaults if d])
+    if isinstance(v, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(v, ast.Attribute):
+        return _import_time_pure(v.value, funcs, module_vars)
+    if isinstance(v, (ast.IfExp, ast.Compare, ast.BoolOp, ast.Tuple)):
+        return all(_import_time_pure(c, funcs, module_vars) for c in ast.iter_child_nodes(v)
+                   if not isinstance(c, (ast.cmpop, ast.boolop, ast.expr_context)))
+    if isinstance(v, ast.Call):
+        if not (isinstance(v.func, ast.Name) and v.func.id in funcs and _pure_def(funcs[v.func.id], module_vars)):
+            return False
+        return all(_import_time_pure(x, funcs, module_vars) for x in v.args + [k.value for k in v.keywords])
+    return False
+
+
+def env_entry_changes(old: str, new: str) -> tuple[str, set[str]] | None:
+    """For an executor/env.py edit: the ENV keys whose entries were added,
+    removed or changed, and the new text with ENV and new helper functions
+    put back as before (left for the function-body rules). None unless ENV
+    stays a literal dict of string keys whose changed values only build
+    function objects, and new functions take unused names."""
+    import builtins
+
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return None
+
+    def env_of(t):
+        hits = [x for x in t.body if isinstance(x, ast.Assign) and len(x.targets) == 1
+                and isinstance(x.targets[0], ast.Name) and x.targets[0].id == "ENV"]
+        if len(hits) != 1 or not isinstance(hits[0].value, ast.Dict):
+            return None, None
+        d = hits[0].value
+        if not all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in d.keys):
+            return None, None
+        out = {k.value: v for k, v in zip(d.keys, d.values)}
+        if len(out) != len(d.keys):
+            return None, None
+        return hits[0], out
+
+    ea, da = env_of(a)
+    eb, db = env_of(b)
+    if ea is None or eb is None:
+        return None
+    keys = {k for k in set(da) | set(db) if k not in da or k not in db or ast.dump(da[k]) != ast.dump(db[k])}
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    old_defs = {x.name for x in a.body if isinstance(x, defs)}
+    used = {n.id for n in ast.walk(a) if isinstance(n, ast.Name)} | {
+        (al.asname or al.name).split(".")[0] for n in ast.walk(a) if isinstance(n, (ast.Import, ast.ImportFrom))
+        for al in n.names}
+    new_defs = [x for x in b.body if isinstance(x, defs) and x.name not in old_defs]
+    module_vars = {t.id for t in ast.walk(b) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)} | \
+        {t.id for t in ast.walk(a) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
+    funcs = {x.name: x for x in a.body if isinstance(x, ast.FunctionDef)}
+    funcs.update({x.name: x for x in b.body if isinstance(x, ast.FunctionDef)})
+    for f in new_defs:
+        if not isinstance(f, ast.FunctionDef) or f.name in used or hasattr(builtins, f.name):
+            return None
+        if not all(_import_time_pure(d, funcs, module_vars) for d in f.decorator_list):
+            return None
+    for k in keys:
+        for v in (da.get(k), db.get(k)):
+            if v is not None and not _import_time_pure(v, funcs, module_vars):
+                return None
+    lines = new.splitlines(True)
+    spans = [(eb.lineno, eb.end_lineno, ast.get_source_segment(old, ea) + "\n")]
+    for f in new_defs:
+        start = min([f.lineno] + [d.lineno for d in f.decorator_list])
+        end = f.end_lineno
+        while end < len(lines) and not lines[end].strip():
+            end += 1  # with the blank lines after it
+        spans.append((start, end, ""))
+    for start, end, repl in sorted(spans, reverse=True):
+        lines[start - 1:end] = [repl] if repl else []
+    return "".join(lines), keys
+
+
+def _changed_old_lines(old: str, new: str) -> set[int]:
+    """Old line numbers a diff touches (an insertion touches both neighbours)."""
+    import difflib
+
+    out: set[int] = set()
+    sm = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines(), autojunk=False)
+    for tag, i1, i2, _, _ in sm.get_opcodes():
+        if tag in ("replace", "delete"):
+            out.update(range(i1 + 1, i2 + 1))
+        elif tag == "insert":
+            out.update((i1, i1 + 1))
+    return out
+
+
+def exec_tpcds_queries(sel: "Selector") -> tuple[list[int], bool] | None:
     """Indices (among executed queries) of the TPC-DS queries whose run on
     the real tables calls a function the patch changes (functions called
-    while importing or loading the tables count for every query); None if
-    a change is outside a function body."""
+    while importing or loading the tables count for every query) or looks
+    up a changed ENV entry, and whether they can be run with the patch
+    swapped in (function bodies only); None if a change is elsewhere."""
     global _tpcds_exec
     if sel.deleted:
         return None
@@ -1848,20 +2009,42 @@ def exec_tpcds_queries(sel: "Selector") -> list[int] | None:
         return None
     import fastlive
 
+    mask = 0
+    swappable = True
+    lines_of: dict[str, set[int]] = {}
     try:
         fastlive.setup(str(SRC))
         for path, text in sel.patched.items():
             old = sel.text(path)
+            if old is None:
+                return None
+            if not path.startswith("sqlglot/executor/"):
+                if tpcds_test_untouched(path, old, text):
+                    continue
+                return None
+            lines_of[path] = set(sel.touched.get(path, ()))
+            if path == ENV_FILE:
+                r = env_entry_changes(old, text)
+                if r is None:
+                    return None
+                neutral, keys = r
+                if neutral != text:
+                    if "names" not in _tpcds_exec:
+                        return None
+                    swappable = False
+                    for k in keys:
+                        mask |= _tpcds_exec["names"].get(k, 0)
+                    text = neutral
+                    lines_of[path] = _changed_old_lines(old, text)
             # only function bodies may differ: no module or class level code, no
             # added, removed or re-declared functions
-            if old is None or fastlive.data_ops(old, text) != [] or \
+            if fastlive.data_ops(old, text) != [] or \
                     fastlive.swaps_for(path, old, text, allow_bodies=True) is None:
                 return None
     except Exception as e:  # noqa: BLE001
         log("executor query check failed:", type(e).__name__, e)
         return None
-    mask = 0
-    for path, lines in sel.touched.items():
+    for path, lines in lines_of.items():
         tree = sel.tree(path)
         if tree is None:
             return None
@@ -1879,7 +2062,7 @@ def exec_tpcds_queries(sel: "Selector") -> list[int] | None:
             f = funcs[0]
             for x in range(f.body[0].lineno, (f.end_lineno or f.lineno) + 1):
                 mask |= per.get(str(x), 0)
-    return [i for i in range(_tpcds_exec["queries"]) if mask >> i & 1]
+    return [i for i in range(_tpcds_exec["queries"]) if mask >> i & 1], swappable
 
 
 def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
@@ -2005,13 +2188,112 @@ def import_failure_users(sel: "Selector") -> set[int]:
     return out
 
 
+_MOD_OBJ_USERS: dict = {}
+
+
+def module_object_users(m: "Map", mod: str, name: str) -> set[int] | None:
+    """Tests that can read module-level object `name` of `mod` at runtime:
+    those that ran a function-body line loading it (in its module or a
+    module that imports it by name), or any sqlglot line reading an
+    attribute of that name, plus test functions mentioning it. None when it
+    is also read at import (derived data) or reachable another way (star
+    imports, a mention outside a test function)."""
+    key = (mod, name)
+    if not mod.startswith("sqlglot.executor."):
+        return None
+    if key in _MOD_OBJ_USERS:
+        return _MOD_OBJ_USERS[key]
+    out: set[int] | None = set()
+    try:
+        files = sorted(str(p.relative_to(SRC)) for p in (SRC / "sqlglot").rglob("*.py"))
+        tests = sorted(str(p.relative_to(SRC)) for p in (SRC / "tests").rglob("*.py"))
+        word = re.compile(rf"\b{re.escape(name)}\b")
+        by_file: dict[str, list[str]] = {}
+        for t in m.tests:
+            by_file.setdefault(t.split("::", 1)[0], []).append(t)
+        index = {t: i for i, t in enumerate(m.tests)}
+        for rel in files + tests:
+            text = (SRC / rel).read_text(encoding="utf-8")
+            if not word.search(text):
+                continue
+            tree = ast.parse(text)
+            own = module_name(rel) == mod
+            binds = own
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom) and n.level == 0 and n.module == mod:
+                    for al in n.names:
+                        if al.name == "*":
+                            raise LookupError("star import")
+                        if al.name == name:
+                            if al.asname not in (None, name):
+                                raise LookupError("renamed import")
+                            binds = True
+            body: dict[int, ast.AST] = {}  # line -> innermost enclosing statement inside a function
+            parents: dict[int, ast.AST] = {}
+
+            def visit(node, func, stmt, path_cls):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    # decorators, defaults and annotations run where the def is
+                    a = node.args
+                    outer = list(getattr(node, "decorator_list", [])) + a.defaults + \
+                        [d for d in a.kw_defaults if d] + \
+                        [x.annotation for x in a.posonlyargs + a.args + a.kwonlyargs if x.annotation] + \
+                        [x.annotation for x in (a.vararg, a.kwarg) if x is not None and x.annotation] + \
+                        ([node.returns] if getattr(node, "returns", None) else [])
+                    for c in outer:
+                        visit_one(c, func, stmt, path_cls)
+                    for c in (node.body if isinstance(node.body, list) else [node.body]):
+                        visit_one(c, node, stmt, path_cls)
+                    return
+                for c in ast.iter_child_nodes(node):
+                    visit_one(c, func, stmt, path_cls)
+
+            def visit_one(c, func, stmt, path_cls):
+                if True:
+                    f2, s2, cls2 = func, stmt, path_cls
+                    if isinstance(c, ast.ClassDef):
+                        cls2 = path_cls + [c.name]
+                    if isinstance(c, ast.stmt):
+                        s2 = c
+                    if isinstance(c, ast.Name) and c.id == name or isinstance(c, ast.Attribute) and c.attr == name:
+                        is_name = isinstance(c, ast.Name)
+                        if is_name and not binds:
+                            pass  # an unrelated local of the same name
+                        elif rel.startswith("tests/"):
+                            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)) or \
+                                    not func.name.startswith("test"):
+                                raise LookupError("mention outside a test function")
+                            hits = [t for t in by_file.get(rel, ())
+                                    if t.split("[", 1)[0].endswith("::" + func.name)]
+                            if not hits:
+                                raise LookupError("unmapped test function")
+                            out.update(index[t] for t in hits)
+                        elif func is None:
+                            if not (own and is_name and isinstance(c.ctx, ast.Store)):
+                                raise LookupError("read at import")
+                        else:
+                            st = s2 or c
+                            out.update(m.span(rel, st.lineno, getattr(c, "lineno", st.lineno)))
+                    visit(c, f2, s2, cls2)
+
+            visit(tree, None, None, [])
+    except (LookupError, OSError, SyntaxError, ValueError):
+        out = None
+    _MOD_OBJ_USERS[key] = out
+    return out
+
+
 def import_change_users(m: "Map", changes: list[str]) -> set[int] | None:
     """Tests that use what changed at import: users of each changed class."""
     out: set[int] = set()
     for entry in changes:
         mod, _, rest = entry.partition(":")
         owner = rest.rsplit(".", 1)[0]
-        if not owner:  # a module-level object: every importer of the module
+        if not owner:  # a module-level object: who reads it at runtime, else every importer
+            users = module_object_users(m, mod, rest.rsplit(".", 1)[-1])
+            if users is not None:
+                out |= users
+                continue
             path = mod.replace(".", "/") + ".py"
             if path not in m.lines:
                 path = mod.replace(".", "/") + "/__init__.py"
@@ -2233,25 +2515,26 @@ def main() -> None:
                 log(f"{commit}: TPC-DS gain {full - rest:.2f}")
                 if full - rest < 2.5:
                     tp = None
-            if sel.no_live or sel.no_fp:
-                tp = None  # import-time code changed: the data-free fingerprint can miss its effect
-            tp_gain = full - rest if tp is not None else 0.0
             files = set(sel.patched) | sel.deleted
             if FP_ON and tp is not None and live_allowed() and executor_only(files):
                 # The executor runs on the data, which the fingerprint never
-                # sees: use which queries reach the changed functions on the
-                # real tables, and run just those.
-                qs = exec_tpcds_queries(sel)
+                # sees: use which queries reach the changed functions or ENV
+                # entries on the real tables, and run just those.
+                r = exec_tpcds_queries(sel)
+                qs, swappable = r if r is not None else (None, False)
                 if qs is not None:
                     log(f"{commit}: TPC-DS executor queries {len(qs)}")
                 if qs == []:
                     keys.discard(tp)
                     log(f"{commit}: no TPC-DS query runs the changed executor code, dropping {TPCDS_EXEC}")
-                elif qs is not None and SCORER_CPU * (1.5 + 0.45 * len(qs)) < 0.8 * tp_gain \
+                elif qs is not None and swappable and not (sel.no_live or sel.no_fp) \
+                        and SCORER_CPU * (1.5 + 0.45 * len(qs)) < 0.8 * (full - rest) \
                         and tpcds_queries_pass(sel, commit, qs):
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS {len(qs)} executor queries pass for real, dropping {TPCDS_EXEC}")
                 tp = None
+            if sel.no_live or sel.no_fp:
+                tp = None  # import-time code changed: the data-free fingerprint can miss its effect
             if FP_ON and tp is not None and live_allowed():
                 diff = fingerprint_diff(sel, files)
                 if diff == []:

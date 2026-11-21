@@ -26,9 +26,27 @@ def fingerprints(on_query=None):
 
     def generate(self, expression):
         trace.append(str(expression))
-        return gen(self, expression)
+        code = gen(self, expression)
+        # the Python source the generator wrote (compile() names it after it)
+        trace.append(getattr(code, "co_filename", repr(code)))
+        return code
 
     E.PythonExecutor.generate = generate
+    register = getattr(E.PythonExecutor, "_register_subquery", None)
+
+    if register is not None:
+        def register_subquery(self, query):
+            # A subquery plan only runs (and generates its code) when a row
+            # evaluates it, never on empty tables: run it once now.
+            name = register(self, query)
+            try:
+                plan = self._subquery_plans[name.name][0]
+                self.execute(plan, None)
+            except Exception as e:  # noqa: BLE001 - a new error is a difference
+                trace.append(f"subquery {type(e).__name__}: {e}")
+            return name
+
+        E.PythonExecutor._register_subquery = register_subquery
     opt = E.optimize
 
     def optimize(*a, **kw):
