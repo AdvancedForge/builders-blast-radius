@@ -43,6 +43,12 @@ SMALL = os.environ.get("BR_SMALL", "0") == "1"
 # Importing these pulls in DuckDB and pandas and sets up process pools: a live
 # run costs 1.3-3 s of CPU, no better than listing.
 HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
+# In-process live runs (fastlive.py): pinned sqlglot and test modules are
+# imported once; each commit forks, swaps the changed function bodies and runs
+# its candidates, costing about the tests' own time.
+FAST = os.environ.get("BR_FAST", "1") == "1"
+SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "3.5"))
+FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "6"))
 SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
@@ -842,6 +848,73 @@ class Selector:
             shutil.rmtree(root, ignore_errors=True)
 
 
+def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> list[dict]:
+    """Run `chosen` in-process on the patched code if that is cheaper than
+    listing it; return the tests to list."""
+    files = set(sel.patched) | sel.deleted
+    if sel.deleted or not files or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
+        return chosen
+    # Code that runs at import built data the swap cannot rebuild.
+    for path, lines in sel.touched.items():
+        if lines & m.import_lines.get(path, set()):
+            return chosen
+    live = [t for t in chosen if t["id"] != TPCDS_EXEC]
+    rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
+    if any(t["file"] in HEAVY_TEST_FILES for t in live):
+        return chosen  # DuckDB/pandas class setup: ~1.3-1.6 s of CPU per run
+    secs = sum(t["seconds"] for t in live)
+    listing = pack_cost([(t["number"], t["seconds"]) for t in chosen])
+    after = pack_cost([(t["number"], t["seconds"]) for t in rest])
+    # A run costs about half the recorded seconds; the scorer's CPU is
+    # ~3.5x slower than where those were measured.
+    if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * (0.03 + 0.55 * secs) >= listing - after:
+        return chosen
+    import resource
+    import fastlive
+
+    c0 = resource.getrusage(resource.RUSAGE_SELF)
+    k0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    try:
+        fastlive.setup(str(SRC))
+        c_setup = resource.getrusage(resource.RUSAGE_SELF)
+        swaps = []
+        for f in files:
+            old = sel.text(f)
+            sw = fastlive.swaps_for(f, old, sel.patched[f]) if old is not None else None
+            if sw is None:
+                log(f"{commit}: fast live: change not confined to function bodies")
+                return chosen
+            swaps += sw
+        if not fastlive.import_tests({t["file"] for t in live}):
+            log(f"{commit}: fast live: test import failed")
+            return chosen
+        c_imp = resource.getrusage(resource.RUSAGE_SELF)
+        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
+        return chosen
+    c1 = resource.getrusage(resource.RUSAGE_SELF)
+    k1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    _u = lambda a, b: b.ru_utime + b.ru_stime - a.ru_utime - a.ru_stime
+    log(f"{commit}: fast cpu setup {_u(c0, c_setup):.2f} imports {_u(c_setup, c_imp):.2f} "
+        f"swap+fork {_u(c_imp, c1):.2f} child {_u(k0, k1):.2f}")
+    if passed is None:
+        log(f"{commit}: fast live: run failed")
+        return chosen
+    kept = [t for t in live if t["id"] not in passed] + rest
+    log(f"{commit}: fast live ran {len(live)} ({secs:.2f}s recorded), {len(live) - len(passed)} failed, "
+        f"parent cpu {c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime:.2f}")
+    return kept
+
+
+def pack_cost(tests: list[tuple[int, float]]) -> float:
+    workers = pack(tests)
+    if not workers:
+        return 0.0
+    sec = dict(tests)
+    return max(sum(sec[n] for n in w) for w in workers) + WORKER_COST * len(workers)
+
+
 def tpcds_queries(sel: "Selector") -> int | None:
     """Bitmask of TPC-DS queries whose processing runs a function the patch
     changes, or None if some change is outside a function (then every query
@@ -1038,6 +1111,8 @@ def main() -> None:
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
+            if FAST and chosen and live_allowed():
+                chosen = fast_live(sel, m, commit, chosen)
             heavy = any(t["file"] in HEAVY_TEST_FILES for t in chosen)
             if SMALL and chosen and code_change and not heavy and live_allowed() and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
                 import resource
