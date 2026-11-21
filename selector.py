@@ -35,13 +35,13 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "maps" / "map.json.gz"))
 LIVE = os.environ.get("BR_LIVE", "0") == "1"  # live proxies cost more CPU than they save
-# Small selections are run live instead of listed: ~0.4 s of CPU against the
+# Small selections are run live instead of listed: ~0.6-1 s of CPU against the
 # 2 s a worker costs, and only tests that really fail are listed.
 SMALL = os.environ.get("BR_SMALL", "1") == "1"
 # Importing these pulls in DuckDB and pandas and sets up process pools: a live
 # run costs 1.3-3 s of CPU, no better than listing.
 HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
-SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "1.5"))
+SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
