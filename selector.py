@@ -1822,6 +1822,66 @@ def tpcds_queries(sel: "Selector") -> int | None:
     return mask
 
 
+TPCDS_EXEC_LINES = Path(os.environ.get("BR_TPCDS_EXEC_LINES", HERE / "maps" / "tpcds_exec_lines.json.gz"))
+_tpcds_exec = None
+
+
+def executor_only(files: set[str]) -> bool:
+    return bool(files) and all(f.startswith("sqlglot/executor/") and f.endswith(".py") for f in files)
+
+
+def exec_tpcds_queries(sel: "Selector") -> list[int] | None:
+    """Indices (among executed queries) of the TPC-DS queries whose run on
+    the real tables calls a function the patch changes (functions called
+    while importing or loading the tables count for every query); None if
+    a change is outside a function body."""
+    global _tpcds_exec
+    if sel.deleted:
+        return None
+    if _tpcds_exec is None:
+        try:
+            with gzip.open(TPCDS_EXEC_LINES, "rt") as fh:
+                _tpcds_exec = json.load(fh)
+        except OSError:
+            _tpcds_exec = {}
+    if not _tpcds_exec:
+        return None
+    import fastlive
+
+    try:
+        fastlive.setup(str(SRC))
+        for path, text in sel.patched.items():
+            old = sel.text(path)
+            # only function bodies may differ: no module or class level code, no
+            # added, removed or re-declared functions
+            if old is None or fastlive.data_ops(old, text) != [] or \
+                    fastlive.swaps_for(path, old, text, allow_bodies=True) is None:
+                return None
+    except Exception as e:  # noqa: BLE001
+        log("executor query check failed:", type(e).__name__, e)
+        return None
+    mask = 0
+    for path, lines in sel.touched.items():
+        tree = sel.tree(path)
+        if tree is None:
+            return None
+        per = _tpcds_exec["lines"].get(path, {})
+        for ln in lines:
+            ch = chain(tree, ln)
+            funcs = [n for n in ch if isinstance(n, FUNC)]
+            if not funcs:
+                if not [n for n in ch if isinstance(n, ast.stmt)]:
+                    continue  # blank or comment
+                return None
+            # The outermost function (nested ones run inside it). Its header
+            # is unchanged (checked above): a header line is only the
+            # neighbour of an insertion into the body.
+            f = funcs[0]
+            for x in range(f.body[0].lineno, (f.end_lineno or f.lineno) + 1):
+                mask |= per.get(str(x), 0)
+    return [i for i in range(_tpcds_exec["queries"]) if mask >> i & 1]
+
+
 def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
     """TPC-DS queries (indices among executed ones) whose transpilation,
     optimized form, plan or generated executor code the patch changes, up to
@@ -2175,8 +2235,24 @@ def main() -> None:
                     tp = None
             if sel.no_live or sel.no_fp:
                 tp = None  # import-time code changed: the data-free fingerprint can miss its effect
+            tp_gain = full - rest if tp is not None else 0.0
+            files = set(sel.patched) | sel.deleted
+            if FP_ON and tp is not None and live_allowed() and executor_only(files):
+                # The executor runs on the data, which the fingerprint never
+                # sees: use which queries reach the changed functions on the
+                # real tables, and run just those.
+                qs = exec_tpcds_queries(sel)
+                if qs is not None:
+                    log(f"{commit}: TPC-DS executor queries {len(qs)}")
+                if qs == []:
+                    keys.discard(tp)
+                    log(f"{commit}: no TPC-DS query runs the changed executor code, dropping {TPCDS_EXEC}")
+                elif qs is not None and SCORER_CPU * (1.5 + 0.45 * len(qs)) < 0.8 * tp_gain \
+                        and tpcds_queries_pass(sel, commit, qs):
+                    keys.discard(tp)
+                    log(f"{commit}: TPC-DS {len(qs)} executor queries pass for real, dropping {TPCDS_EXEC}")
+                tp = None
             if FP_ON and tp is not None and live_allowed():
-                files = set(sel.patched) | sel.deleted
                 diff = fingerprint_diff(sel, files)
                 if diff == []:
                     keys.discard(tp)
