@@ -1252,6 +1252,58 @@ def class_data_change(sel: "Selector", files: set[str]) -> bool:
     return False
 
 
+def fixture_pairs(text: str) -> list[tuple]:
+    """tests/helpers.load_sql_fixture_pairs on a text."""
+    filtered = "\n".join(l for l in text.splitlines() if l and not l.startswith("--"))
+    st = filtered.split(";")
+    return [(st[i].strip(), st[i + 1].strip()) for i in range(0, len(st), 2) if i + 1 < len(st)]
+
+
+def fixture_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> list[dict]:
+    """A commit that only edits optimizer fixture entries: run the optimizer
+    tests that read them on just the changed entries, with the patched text."""
+    import fastlive
+
+    files = set(sel.patched) | sel.deleted
+    if sel.deleted or not files or not all(
+            f.startswith("tests/fixtures/optimizer/") and f.endswith(".sql") for f in files):
+        return chosen
+    if not all(t["file"] == "tests/test_optimizer.py" for t in chosen) or not chosen:
+        return chosen
+    texts, mask = {}, 0
+    for f in files:
+        old, new = sel.text(f), sel.patched.get(f)
+        if old is None or new is None:
+            return chosen
+        a, b = fixture_pairs(old), fixture_pairs(new)
+        if len(a) != len(b):
+            return chosen  # entries added or removed: numbering shifts
+        for i, (x, y) in enumerate(zip(a, b), start=1):
+            if x != y:
+                mask |= 1 << i
+        texts[f[len("tests/fixtures/"):]] = new
+    if not mask:
+        return []
+    listing = pack_cost([(t["number"], t["seconds"]) for t in chosen])
+    est = 0.3 + 0.05 * bin(mask).count("1")
+    if SCORER_CPU * est >= 0.8 * listing:
+        return chosen
+    try:
+        fastlive.setup(str(SRC))
+        if not fastlive.import_tests({"tests/test_optimizer.py"}):
+            return chosen
+        masks = {t["id"]: mask for t in chosen}
+        passed = fastlive.run([t["id"] for t in chosen], [], LIVE_TIMEOUT, masks=masks, fixtures=texts)
+    except Exception as e:  # noqa: BLE001
+        log(f"{commit}: fixture live failed: {type(e).__name__}: {e}")
+        return chosen
+    if passed is None:
+        return chosen
+    log(f"{commit}: fixture live ran {len(chosen)} on {bin(mask).count('1')} entries, "
+        f"{len(chosen) - len(passed)} failed")
+    return [t for t in chosen if t["id"] not in passed]
+
+
 def pack_cost(tests: list[tuple[int, float]]) -> float:
     workers = pack(tests)
     if not workers:
@@ -1534,7 +1586,10 @@ def main() -> None:
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
             if FAST and chosen and live_allowed():
-                chosen = fast_live(sel, m, commit, chosen)
+                if all(f.startswith("tests/fixtures/") for f in set(sel.patched) | sel.deleted):
+                    chosen = fixture_live(sel, m, commit, chosen)
+                else:
+                    chosen = fast_live(sel, m, commit, chosen)
             heavy = any(t["file"] in HEAVY_TEST_FILES for t in chosen)
             if SMALL and chosen and code_change and not heavy and live_allowed() and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
                 import resource

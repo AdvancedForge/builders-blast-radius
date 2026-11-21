@@ -379,6 +379,30 @@ def _restrict_entries(masks: dict[str, int]) -> None:
     TO.load_sql_fixture_pairs = pairs
 
 
+def _patch_fixtures(texts: dict[str, str]) -> None:
+    """In the child: every tests/helpers fixture loader (pairs, plain lists,
+    anything that opens a fixture through the module) reads these patched
+    texts (keys are paths relative to tests/fixtures/)."""
+    import builtins
+    import io
+    import os as _os
+
+    import tests.helpers as H
+
+    real_open = builtins.open
+    fixtures_dir = _os.path.realpath(H.FIXTURES_DIR)
+
+    def fixture_open(path, *a, **kw):
+        p = _os.path.realpath(str(path))
+        if p.startswith(fixtures_dir + _os.sep):
+            rel = p[len(fixtures_dir) + 1:]
+            if rel in texts:
+                return io.StringIO(texts[rel])
+        return real_open(path, *a, **kw)
+
+    H.open = fixture_open
+
+
 def _restrict_tpcds(queries: list[int]) -> None:
     """In the child: TestExecutor's TPC-DS test runs only these queries
     (indices among the queries it executes, as tpc_fp numbers them)."""
@@ -396,7 +420,7 @@ def _restrict_tpcds(queries: list[int]) -> None:
 
 def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
         defer: set[str] | None = None, masks: dict[str, int] | None = None,
-        tpcds: list[int] | None = None) -> set[str] | None:
+        tpcds: list[int] | None = None, fixtures: dict[str, str] | None = None) -> set[str] | None:
     """Fork, apply swaps, run the tests; return the node ids that passed."""
     names = {_to_unittest(n): n for n in node_ids}
     r, w = os.pipe()
@@ -415,6 +439,8 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
                     f.__code__ = nc
             for modname, ops in (data or []):
                 _apply_data(sys.modules[modname], ops)
+            if fixtures:
+                _patch_fixtures(fixtures)  # before masks, which wrap the loader again
             if masks:
                 _restrict_entries(masks)
             if tpcds is not None:
