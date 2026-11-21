@@ -16,6 +16,7 @@ import sys
 
 
 DEEP = os.environ.get("BR_IMPORT_DEEP", "1") == "1"
+VALS = os.environ.get("BR_IMPORT_VALS", "1") == "1"  # plain values (val| entries)
 # Deep hashing only for these modules' globals and classes, and classes that
 # inherit from them (where state derived from a change can live); all if unset.
 FAILED: list = []
@@ -84,7 +85,7 @@ def fingerprint():
         elif isinstance(value, dict):
             exprs = [f"{k!r}:{v.sql()}" for k, v in value.items() if isinstance(v, Expr)]
             out[where] = f"keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else "")
-        elif isinstance(value, (bool, int, float, str, bytes, tuple, frozenset, enum.Enum)) or value is None:
+        elif VALS and (isinstance(value, (bool, int, float, str, bytes, tuple, frozenset, enum.Enum)) or value is None):
             out["val|" + where] = canon(value)  # plain values: only gate import-time live runs
         if DEEP and deep_ok[0] and isinstance(value, (dict, set, frozenset, list, tuple)):
             out["deep|" + where] = canon(value)
@@ -140,6 +141,8 @@ if __name__ == "__main__":
         base = {k: v for k, v in base.items() if mod_of(k) in ONLY}
     if not DEEP:
         base = {k: v for k, v in base.items() if not k.startswith("deep|")}
+    if not VALS:
+        base = {k: v for k, v in base.items() if not k.startswith("val|")}
     elif DEEP_MODULES is not None:
         base = {k: v for k, v in base.items() if not k.startswith("deep|") or k in fp}
     for k in sorted(set(base) | set(fp)):

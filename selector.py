@@ -817,6 +817,7 @@ class Selector:
                     # (fast_live requires that for import-time changes).
                     outer = next(n for n in ch if isinstance(n, FUNC))
                     self.no_live = self.no_live or not escape_free(outer)
+                    self.want_vals = True  # fast_live then needs every built value compared
                     self.no_fp = True
                     self.needs_import_check = True
                     self.import_deep_users = True
@@ -1193,6 +1194,7 @@ class Selector:
         self.needs_import_check = False
         self.no_live = False
         self.no_fp = False
+        self.want_vals = False
         self.import_failed = False
         self.import_deep_users = False
         self._import_result = _UNSET
@@ -1838,6 +1840,7 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
                    BR_IMPORT_DEEP="1",
+                   BR_IMPORT_VALS="1" if getattr(sel, "want_vals", False) else "0",
                    BR_DEEP_MODULES=",".join(deep_modules(sel)),
                    BR_IMPORT_ONLY=",".join(deep_modules(sel)))
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
