@@ -227,6 +227,25 @@ def header_end(node: ast.AST) -> int:
     return node.end_lineno or node.lineno
 
 
+def is_bare_string(node: ast.AST) -> bool:
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
+def strip_docstrings(tree: ast.AST) -> ast.AST:
+    """A copy of `tree` without bare string statements (docstrings).
+
+    Nothing in the suite reads docstrings: the doctests are loaded through
+    unittest's load_tests, which pytest does not run."""
+    import copy
+    tree = copy.deepcopy(tree)
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list):
+            kept = [x for x in body if not is_bare_string(x)]
+            node.body = kept or [ast.Pass()]
+    return tree
+
+
 def module_name(path: str) -> str:
     return path[:-3].replace("/", ".").removesuffix(".__init__")
 
@@ -296,6 +315,8 @@ class Selector:
         stmts = [n for n in ch if isinstance(n, ast.stmt)]
         if not stmts:
             return set() if names_hint else m.file_any(path)
+        if is_bare_string(stmts[-1]):
+            return set()  # a docstring or bare string: no effect at runtime
         funcs = [i for i, n in enumerate(ch) if isinstance(n, FUNC)]
         lambdas = [i for i, n in enumerate(ch) if isinstance(n, ast.Lambda)]
         classes = [n for n in ch if isinstance(n, ast.ClassDef)]
@@ -422,7 +443,7 @@ class Selector:
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
         old_tree = self.tree(fp.old)
-        if ast.dump(old_tree) == ast.dump(new_tree):
+        if ast.dump(strip_docstrings(old_tree)) == ast.dump(strip_docstrings(new_tree)):
             return set()
         if fp.new != fp.old:
             return m.importers(fp.old)
