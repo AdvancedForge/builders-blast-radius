@@ -1132,6 +1132,7 @@ def entry_mask(sel: "Selector", test: str) -> int | None:
         tree = sel.tree(path)
         per = e["lines"].get(path, {})
         outside = set(e["outside"].get(path, ()))
+        setup = set(e.get("setup", {}).get(path, ()))
         for ln in lines:
             ch = chain(tree, ln)
             funcs = [n for n in ch if isinstance(n, FUNC)]
@@ -1146,6 +1147,8 @@ def entry_mask(sel: "Selector", test: str) -> int | None:
                 continue
             f = funcs[-1]
             span = range(start(f), (f.end_lineno or f.lineno) + 1)
+            if any(x in setup for x in span):
+                return None  # setUp builds data every entry consumes (self.schema)
             if any(x in outside for x in span) and not data_pure_test(sel, test):
                 return None  # outside code may compute data the entries consume
             for x in span:
