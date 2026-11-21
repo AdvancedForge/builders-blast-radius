@@ -510,14 +510,18 @@ class Selector:
         mods = {mod} | set(_REVDEPS.get(mod, ()))
         out: set[int] = set()
         if broken:
-            # A test module importing it at collection cannot be imported. The
-            # README counts that per file, but a plain pytest run stops on a
-            # collection error and every test fails: a miss costs 300 s, the
-            # narrowing saves ~25, so stay with everything.
+            # A test module importing it at collection cannot be imported, so
+            # all its tests fail. The README counts failures per test ("a
+            # failure, an error or a timeout for the test, or the test's file
+            # cannot be imported"): tests in files that import fine fail only
+            # if they themselves fail, even if pytest stops early (an unrun
+            # test reports nothing). So: those whole files plus the users.
             rels = {r for n in mods for r in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py")}
             for tf, cm in self.m.closure.items():
-                if cm is None or rels & set(cm) or tf in rels:
-                    raise Everything(f"{path} breaks collection of {tf}")
+                if cm is None:
+                    raise Everything(f"unknown import closure of {tf}")
+                if rels & set(cm) or tf in rels:
+                    out |= self.m.prefix(tf + "::")
         for mname in mods:
             for rel in (mname.replace(".", "/") + ".py", mname.replace(".", "/") + "/__init__.py"):
                 if rel in self.m.lines:
