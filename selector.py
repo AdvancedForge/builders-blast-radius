@@ -60,7 +60,7 @@ def live_allowed() -> bool:
 IMPORT_BASE = Path(os.environ.get("BR_IMPORT_BASE", HERE / "import_fp.json"))
 TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_BASE = Path(os.environ.get("BR_TPCDS_BASE", HERE / "tpcds_fp.json"))
-FP_ON = os.environ.get("BR_FP", "1") == "1"
+FP_ON = os.environ.get("BR_FP", "0") == "1"  # costs more CPU than it saves on the scorer
 # Code that runs on the data itself, which a data-free fingerprint cannot see.
 DATA_TIME = ("sqlglot/executor/", "sqlglot/helper.py", "sqlglot/time.py", "sqlglot/schema.py",
              "tests/", "sqlglot/__init__.py", "sqlglot/expressions/datatypes.py")
@@ -267,6 +267,23 @@ def header_end(node: ast.AST) -> int:
     if isinstance(node, ast.Match) and node.cases:
         return node.cases[0].pattern.lineno - 1
     return node.end_lineno or node.lineno
+
+
+def in_string(tree: ast.AST, line: int) -> bool:
+    """True if `line` lies inside a multi-line string literal (so a line that
+    looks like a comment is really string content)."""
+    node = tree
+    while True:
+        nxt = None
+        for child in ast.iter_child_nodes(node):
+            if hasattr(child, "lineno") and start(child) <= line <= (child.end_lineno or child.lineno):
+                nxt = child
+                break
+        if nxt is None:
+            return False
+        if isinstance(nxt, (ast.Constant, ast.JoinedStr)) and nxt.lineno < line <= (nxt.end_lineno or nxt.lineno):
+            return True
+        node = nxt
 
 
 def is_bare_string(node: ast.AST) -> bool:
@@ -615,7 +632,9 @@ class Selector:
         new_text, removed, added = apply(old_text, fp)
         if fp.new is not None:
             self.patched[fp.new] = new_text
-        if fp.new is None:  # deleted
+        if fp.new is None or (fp.old and fp.new != fp.old):  # deleted or renamed
+            if path.startswith("sqlglot/"):
+                raise Everything(f"module removed: {path}")  # dialects load lazily from everywhere
             return m.importers(path)
         try:
             new_tree = ast.parse(new_text.encode("utf-8"))
@@ -626,9 +645,15 @@ class Selector:
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
         old_tree = self.tree(fp.old)
-        if ast.dump(normalize(ast.parse(old_text.encode("utf-8")), path)) == ast.dump(
-                normalize(ast.parse(new_text.encode("utf-8")), path)):
-            return set()
+        old_lines = old_text.split("\n")
+        new_lines = new_text.split("\n")
+        # The whole-module comparison (docstrings, == None) costs two parses
+        # and dumps; comment and blank lines are cheaper to rule out per line.
+        touched = [old_lines[i - 1] for i in removed] + [new_lines[n - 1] for _, n in added]
+        if "None" in "".join(touched) or any('"""' in l or "'''" in l for l in touched):
+            if ast.dump(normalize(ast.parse(old_text.encode("utf-8")), path)) == ast.dump(
+                    normalize(ast.parse(new_text.encode("utf-8")), path)):
+                return set()
         if fp.new != fp.old:
             return m.importers(fp.old)
 
@@ -637,10 +662,11 @@ class Selector:
         out: set[int] = set()
         for ln in removed:
             code = old_lines[ln - 1].strip()
-            if not code or code.startswith("#"):
+            if (not code or code.startswith("#")) and not in_string(old_tree, ln):
                 continue  # removing a blank or comment line changes nothing
             loc = self.at_line(path, old_tree, ln, self.key_names(old_lines[ln - 1]))
             self.locs.append(loc); out |= loc
+        self._new_lines = new_lines
         for k, n in added:
             loc = self.added_line(path, old_tree, new_tree, k, n, self.key_names(new_lines[n - 1]), old_lines)
             self.locs.append(loc); out |= loc
@@ -648,10 +674,15 @@ class Selector:
 
     def added_line(self, path, old_tree, new_tree, k, n, names, old_lines) -> set[int]:
         """A line inserted before old line k, at new line n."""
+        code = self._new_lines[n - 1].strip()
+        if (not code or code.startswith("#")) and not in_string(new_tree, n):
+            return set()  # a blank or comment line
         nch = chain(new_tree, n)
         nstmts = [x for x in nch if isinstance(x, ast.stmt)]
         if not nstmts:
             return set()  # blank or comment
+        if is_bare_string(nstmts[-1]):
+            return set()  # inside a docstring: no effect at runtime
         # Old neighbours that are code: the statement just before and just after.
         out: set[int] = set()
         for cand in (k - 1, k):

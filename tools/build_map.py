@@ -40,7 +40,14 @@ for path in sorted(data.measured_files()):
             if c.startswith("COLLECT:"):
                 ids += [tkey(t) for t in all_nodeids if t.startswith(c[8:] + "::")]
             elif c:
-                ids.append(tkey(c.split("|")[0]))
+                nodeid, _, phase = c.partition("|")
+                if phase in ("setup", "teardown"):
+                    # setUpClass/tearDownClass run in the first/last test's
+                    # setup/teardown but serve every test in the class.
+                    cls = nodeid.rsplit("::", 1)[0] + "::"
+                    ids += [tkey(t) for t in all_nodeids if t.startswith(cls)]
+                else:
+                    ids.append(tkey(nodeid))
         if ids:
             per[str(ln)] = skey(ids)
         if "" in ctxs:
