@@ -268,6 +268,8 @@ class Selector:
         self._texts: dict[str, str] = {}
         self._trees: dict[str, ast.AST] = {}
         self._exp_users: dict[str, set[int] | None] = {}
+        self._refs: dict[str, set[int]] = {}
+        self._lines: dict[str, list[str]] = {}
 
     def text(self, rel: str) -> str | None:
         if rel not in self._texts:
@@ -297,22 +299,38 @@ class Selector:
     def class_users(self, path: str, quals: list[str]) -> set[int] | None:
         return self.m.users(f"{module_name(path)}:{'.'.join(quals)}")
 
+    def lines_of(self, rel: str) -> list[str]:
+        if rel not in self._lines:
+            t = self.text(rel)
+            self._lines[rel] = t.split("\n") if t is not None else []
+        return self._lines[rel]
+
     def refs(self, names: set[str], depth: int = 0) -> set[int]:
-        """Tests that ran code referring to any of `names`, across sqlglot."""
+        """Tests that ran code referring to any of `names`, across sqlglot.
+
+        Memoized per name; a name already being resolved contributes nothing
+        on the way back in, so module-level names that refer to each other
+        cannot recurse without end."""
         out: set[int] = set()
-        if not names:
-            return out
-        pat = re.compile(r"\b(" + "|".join(map(re.escape, sorted(names))) + r")\b")
-        for rel in self.m.lines:
-            if not rel.startswith("sqlglot/"):
+        for name in names:
+            if name in self._refs:
+                out |= self._refs[name]
                 continue
-            text = self.text(rel)
-            if text is None or not pat.search(text):
-                continue
-            tree = self.tree(rel)
-            for i, l in enumerate(text.split("\n"), 1):
-                if pat.search(l) and not l.lstrip().startswith("#"):
-                    out |= self.at_line(rel, tree, i, set(), depth + 1, names_hint=True)
+            self._refs[name] = set()  # guard against cycles
+            pat = re.compile(r"\b" + re.escape(name) + r"\b")
+            found: set[int] = set()
+            for rel in self.m.lines:
+                if not rel.startswith("sqlglot/"):
+                    continue
+                text = self.text(rel)
+                if text is None or name not in text or not pat.search(text):
+                    continue
+                tree = self.tree(rel)
+                for i, l in enumerate(self.lines_of(rel), 1):
+                    if name in l and pat.search(l) and not l.lstrip().startswith("#"):
+                        found |= self.at_line(rel, tree, i, set(), depth + 1, names_hint=True)
+            self._refs[name] = found
+            out |= found
         return out
 
     # -- core: tests that can notice a change at old line `ln` of `path`
