@@ -18,6 +18,8 @@ import sys
 DEEP = os.environ.get("BR_IMPORT_DEEP", "1") == "1"
 # Deep hashing only for these modules' globals and classes, and classes that
 # inherit from them (where state derived from a change can live); all if unset.
+FAILED: list = []
+ONLY = set(filter(None, os.environ.get("BR_IMPORT_ONLY", "").split(","))) or None
 DEEP_MODULES = set(filter(None, os.environ.get("BR_DEEP_MODULES", "").split(","))) or None
 
 
@@ -28,16 +30,21 @@ def fingerprint():
     import sqlglot.dialects as d
 
     mods = []
+    # Only modules a patch can affect (it and its importers) need importing;
+    # every other module keeps its pinned import-time state.
+    only = ONLY
     for m in sorted(pkgutil.walk_packages(sqlglot.__path__, "sqlglot."), key=lambda m: m.name):
-        if m.name == "sqlglot.__main__":
+        if m.name == "sqlglot.__main__" or (only is not None and m.name not in only):
             continue
         try:
             mods.append(importlib.import_module(m.name))
         except ImportError as e:
             if "No module named" not in str(e):
                 raise
-    for name in getattr(d, "DIALECTS", []):
-        Dialect.get_or_raise(name.lower())
+            FAILED.append(m.name)  # optional dependency missing (compared with the base)
+    if only is None:
+        for name in getattr(d, "DIALECTS", []):
+            Dialect.get_or_raise(name.lower())
 
     out = {}
 
@@ -117,9 +124,18 @@ if __name__ == "__main__":
         print("import_fp:", type(e).__name__, e, file=sys.stderr)
         sys.exit(1)
     if mode == "base":
+        fp["__failed__"] = sorted(FAILED)
         json.dump(fp, open(path, "w"))
         sys.exit(0)
     base = json.load(open(path))
+    new_failures = set(FAILED) - set(base.pop("__failed__", []))
+    if new_failures:
+        print("import_fp: newly failing imports:", sorted(new_failures), file=sys.stderr)
+        sys.exit(1)
+    if ONLY is not None:
+        def mod_of(k):
+            return k.removeprefix("deep|").split(":", 1)[0]
+        base = {k: v for k, v in base.items() if mod_of(k) in ONLY}
     if not DEEP:
         base = {k: v for k, v in base.items() if not k.startswith("deep|")}
     elif DEEP_MODULES is not None:

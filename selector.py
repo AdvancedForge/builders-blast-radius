@@ -1559,7 +1559,8 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
                    BR_IMPORT_DEEP="1",
-                   BR_DEEP_MODULES=",".join(deep_modules(sel)))
+                   BR_DEEP_MODULES=",".join(deep_modules(sel)),
+                   BR_IMPORT_ONLY=",".join(deep_modules(sel)))
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         if r.returncode != 0:
