@@ -65,7 +65,7 @@ DIFF_MAX = int(os.environ.get("BR_DIFF_MAX", "12"))
 # after this much wall time so a hanging patch cannot get the run rejected.
 import time as _time
 STARTED = _time.monotonic()
-LIVE_BUDGET = float(os.environ.get("BR_LIVE_BUDGET", "90"))
+LIVE_BUDGET = float(os.environ.get("BR_LIVE_BUDGET", "140"))
 
 
 def live_allowed() -> bool:
@@ -508,14 +508,16 @@ class Selector:
                 _REVDEPS = {}
         mod = module_name(path)
         mods = {mod} | set(_REVDEPS.get(mod, ()))
+        out: set[int] = set()
         if broken:
-            # A test module importing it at collection errors, and a collection
-            # error stops the whole pytest run: every test fails.
+            # A test module importing it at collection cannot be imported. The
+            # README counts that per file, but a plain pytest run stops on a
+            # collection error and every test fails: a miss costs 300 s, the
+            # narrowing saves ~25, so stay with everything.
             rels = {r for n in mods for r in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py")}
             for tf, cm in self.m.closure.items():
                 if cm is None or rels & set(cm) or tf in rels:
                     raise Everything(f"{path} breaks collection of {tf}")
-        out: set[int] = set()
         for mname in mods:
             for rel in (mname.replace(".", "/") + ".py", mname.replace(".", "/") + "/__init__.py"):
                 if rel in self.m.lines:
