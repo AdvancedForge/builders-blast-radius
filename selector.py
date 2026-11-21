@@ -503,12 +503,43 @@ class Selector:
             text = self.text(rel)
             if text is None or name not in text:
                 continue
+            tree = None
             for i, l in enumerate(self.lines_of(rel), 1):
                 if name in l and pat.search(l) and not l.lstrip().startswith("#"):
                     if re.match(r"\s*" + re.escape(name) + r"\s*[:=]", l):
                         continue  # a definition or override
-                    out |= self.m.line(rel, i)
+                    tree = tree or self.tree(rel)
+                    out |= self.local_flow(rel, tree, i, name)
         self._reads_cache[key] = out
+        return out
+
+    def local_flow(self, rel: str, tree, ln: int, name: str) -> set[int]:
+        """Tests for which reading `name` on line `ln` can matter. When the
+        line only copies it into a local (`x = ...name...`), the value can
+        only act through later uses of that local: the tests that ran one.
+        Otherwise the tests that ran the line."""
+        ch = chain(tree, ln)
+        funcs = [n for n in ch if isinstance(n, FUNC)]
+        stmts = [n for n in ch if isinstance(n, ast.stmt)]
+        st = stmts[-1] if stmts else None
+        if not funcs or not isinstance(st, ast.Assign) or len(st.targets) != 1 \
+                or not isinstance(st.targets[0], ast.Name) or st.lineno != st.end_lineno:
+            return self.m.line(rel, ln)
+        var = st.targets[0].id
+        fn = funcs[-1]
+        uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == var
+                and isinstance(n.ctx, ast.Load)]
+        # Other writes to the local, or uses in nested functions/lambdas
+        # (which may run elsewhere), keep the plain line coverage.
+        stores = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == var
+                  and isinstance(n.ctx, ast.Store)]
+        nested = [n for n in ast.walk(fn) if isinstance(n, (ast.Lambda,) + FUNC) and n is not fn
+                  and any(isinstance(x, ast.Name) and x.id == var for x in ast.walk(n))]
+        if len(stores) != 1 or nested or not uses:
+            return self.m.line(rel, ln)
+        out: set[int] = set()
+        for u in uses:
+            out |= self.m.line(rel, u.lineno)
         return out
 
     def runtime_reads(self, name: str) -> set[int] | None:
