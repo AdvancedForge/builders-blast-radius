@@ -355,7 +355,8 @@ def _to_unittest(node_id: str) -> str:
     return f"{f[:-3].replace('/', '.')}.{cls}.{meth}"
 
 
-def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None) -> set[str] | None:
+def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
+        defer: set[str] | None = None) -> set[str] | None:
     """Fork, apply swaps, run the tests; return the node ids that passed."""
     names = {_to_unittest(n): n for n in node_ids}
     r, w = os.pipe()
@@ -375,12 +376,19 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
             for modname, ops in (data or []):
                 _apply_data(sys.modules[modname], ops)
             loader = unittest.TestLoader()
-            suite = unittest.TestSuite()
+            first, second = unittest.TestSuite(), unittest.TestSuite()
             for name in names:
-                suite.addTests(loader.loadTestsFromName(name))
-            planned = {t.id() for t in _iter(suite)}  # unittest empties the suite as it runs
+                (second if names[name].split("::")[0] in (defer or ()) else first).addTests(
+                    loader.loadTestsFromName(name))
+            planned = {t.id() for t in _iter(first)}  # unittest empties the suite as it runs
+            later = {t.id() for t in _iter(second)}
             result = _Result()
-            suite.run(result)
+            first.run(result)
+            # Once something fails a worker is paid for anyway, and listing a
+            # deferred (optimizer/executor) test costs no more than running it.
+            if not result.failed:
+                planned |= later
+                second.run(result)
             # A failure that is not a candidate test (setUpClass, a module
             # import) fails every candidate of its class, or all of them.
             failed = set()

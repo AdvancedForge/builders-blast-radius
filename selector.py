@@ -1038,7 +1038,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             log(f"{commit}: fast live: test import failed")
             return chosen
         c_imp = resource.getrusage(resource.RUSAGE_SELF)
-        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data)
+        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data, defer=HEAVY_TEST_FILES)
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
         return chosen
