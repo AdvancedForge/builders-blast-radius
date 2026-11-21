@@ -774,11 +774,15 @@ class Selector:
                     # what it builds acts at runtime through the closures it
                     # creates (covered per test) and through class data (the deep
                     # import check names changed attributes, whose class users are
-                    # added). A live child cannot re-run it.
-                    self.no_live = True
+                    # added). A live child cannot re-run it, unless nothing it
+                    # creates outlives the call (no escaping inner function) and
+                    # the import check shows every value it built unchanged
+                    # (fast_live requires that for import-time changes).
+                    outer = next(n for n in ch if isinstance(n, FUNC))
+                    self.no_live = self.no_live or not escape_free(outer)
+                    self.no_fp = True
                     self.needs_import_check = True
                     self.import_deep_users = True
-                    outer = next(n for n in ch if isinstance(n, FUNC))
                     return m.span(path, start(outer), outer.end_lineno or outer.lineno)
             for n in inner:
                 if isinstance(n, COMPOUND) or isinstance(n, FUNC + (ast.ClassDef,)):
@@ -1148,6 +1152,7 @@ class Selector:
         self.touched: dict[str, set[int]] = {}
         self.needs_import_check = False
         self.no_live = False
+        self.no_fp = False
         self.import_failed = False
         self.import_deep_users = False
         self._import_result = _UNSET
@@ -1237,6 +1242,36 @@ def tpc_cache_ok(sel: "Selector") -> bool:
     nothing that parses or holds them is patched."""
     return not any(f.startswith(("tests/", "sqlglot/executor/")) or f == "sqlglot/helper.py"
                    for f in set(sel.patched) | sel.deleted)
+
+
+def escape_free(fn: ast.AST) -> bool:
+    """Nothing `fn` creates can outlive a call: inner functions are only ever
+    called directly, and there are no lambdas, inner classes or yields. Then
+    swapping its code is faithful for later calls; values it returned at
+    import are compared by the import check."""
+    inner = set()
+    for n in ast.walk(fn):
+        if n is fn:
+            continue
+        if isinstance(n, (ast.Lambda, ast.ClassDef, ast.Yield, ast.YieldFrom, ast.Await)):
+            return False
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # typing.overload only registers the stub for introspection
+            if any(ast.unparse(d) not in ("t.overload", "typing.overload", "overload") for d in n.decorator_list):
+                return False
+            inner.add(n.name)
+    if not inner:
+        return True
+    called = set()
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            called.add(id(n.func))
+    for n in ast.walk(fn):
+        if isinstance(n, ast.Name) and n.id in inner and id(n) not in called:
+            return False  # returned, stored or passed on
+        if isinstance(n, ast.Global):  # nonlocal only rebinds the call's own locals
+            return False
+    return True
 
 
 def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> list[dict]:
@@ -1331,6 +1366,9 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             attrs = {op[1] for _, ops in data for op in ops}
             attrs |= {d for a in list(attrs) for d in fastlive.DERIVED.get(a, ())}
             deep = getattr(sel, "import_deep", None) if changes is not None else None
+            vals = [c for c in (getattr(sel, "import_vals", None) or []) if c.rsplit(".", 1)[-1] not in attrs]
+            if at_import and not data and (changes or vals):
+                deep = None  # import-time code changed a value it built
             if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
                 log(f"{commit}: fast live: class data feeds import-time state")
                 return chosen
@@ -1754,6 +1792,7 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         return sel._import_result  # already checked for this commit
     sel._import_result = None
     sel.import_deep = None
+    sel.import_vals = None
     root = Path(tempfile.mkdtemp(prefix="bri", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
@@ -1768,7 +1807,8 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
             return None
         lines = [l for l in r.stdout.decode().split("\n") if l]
         sel.import_deep = [l[5:] for l in lines if l.startswith("deep|")]
-        sel._import_result = [l for l in lines if not l.startswith("deep|")]
+        sel.import_vals = [l[4:] for l in lines if l.startswith("val|")]
+        sel._import_result = [l for l in lines if not l.startswith(("deep|", "val|"))]
         return sel._import_result
     except Exception as e:  # noqa: BLE001
         log("import check failed:", type(e).__name__, e)
@@ -2018,7 +2058,7 @@ def main() -> None:
                 log(f"{commit}: TPC-DS gain {full - rest:.2f}")
                 if full - rest < 2.5:
                     tp = None
-            if sel.no_live:
+            if sel.no_live or sel.no_fp:
                 tp = None  # import-time code changed: the data-free fingerprint can miss its effect
             if FP_ON and tp is not None and live_allowed():
                 files = set(sel.patched) | sel.deleted

@@ -84,6 +84,8 @@ def fingerprint():
         elif isinstance(value, dict):
             exprs = [f"{k!r}:{v.sql()}" for k, v in value.items() if isinstance(v, Expr)]
             out[where] = f"keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else "")
+        elif isinstance(value, (bool, int, float, str, bytes, tuple, frozenset, enum.Enum)) or value is None:
+            out["val|" + where] = canon(value)  # plain values: only gate import-time live runs
         if DEEP and deep_ok[0] and isinstance(value, (dict, set, frozenset, list, tuple)):
             out["deep|" + where] = canon(value)
 
@@ -134,7 +136,7 @@ if __name__ == "__main__":
         sys.exit(1)
     if ONLY is not None:
         def mod_of(k):
-            return k.removeprefix("deep|").split(":", 1)[0]
+            return k.removeprefix("deep|").removeprefix("val|").split(":", 1)[0]
         base = {k: v for k, v in base.items() if mod_of(k) in ONLY}
     if not DEEP:
         base = {k: v for k, v in base.items() if not k.startswith("deep|")}
