@@ -255,12 +255,10 @@ def is_bare_string(node: ast.AST) -> bool:
 
 
 def strip_docstrings(tree: ast.AST) -> ast.AST:
-    """A copy of `tree` without bare string statements (docstrings).
+    """`tree` (modified in place) without bare string statements (docstrings).
 
     Nothing in the suite reads docstrings: the doctests are loaded through
     unittest's load_tests, which pytest does not run."""
-    import copy
-    tree = copy.deepcopy(tree)
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
         if isinstance(body, list):
@@ -600,7 +598,8 @@ class Selector:
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
         old_tree = self.tree(fp.old)
-        if ast.dump(normalize(old_tree, path)) == ast.dump(normalize(new_tree, path)):
+        if ast.dump(normalize(ast.parse(old_text.encode("utf-8")), path)) == ast.dump(
+                normalize(ast.parse(new_text.encode("utf-8")), path)):
             return set()
         if fp.new != fp.old:
             return m.importers(fp.old)
