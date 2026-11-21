@@ -165,6 +165,9 @@ def _data_ops(old_text: str, new_text: str):
         return None
     seg_new = new_text
     ops = []
+    future = any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+                 for n in a.body) and any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+                                          and any(a.name == "annotations" for a in n.names) for n in b.body)
 
     def same(x, y):
         return ast.dump(x) == ast.dump(y)
@@ -185,7 +188,7 @@ def _data_ops(old_text: str, new_text: str):
             for name in sorted(gone):
                 ops.append((path, name, "delmethod", None, None))
             for name in sorted(new):
-                ops.append((path, name, "addmethod", None, ast.get_source_segment(seg_new, fy[name])))
+                ops.append((path, name, "addmethod", None, _def_source(seg_new, fy[name])))
             xs = [n for n in xs if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in gone)]
             ys = [n for n in ys if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in new)]
         if len(xs) != len(ys):
@@ -197,7 +200,14 @@ def _data_ops(old_text: str, new_text: str):
                 return False
             if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if func_shape(x) != func_shape(y):
-                    return False  # signature, defaults or decorators: evaluated at import
+                    if future and func_shape(_strip_ann(x)) == func_shape(_strip_ann(y)):
+                        continue  # postponed annotations: only __annotations__ strings differ
+                    if path and x.name == y.name and _replaceable(x) and _replaceable(y):
+                        # signature, defaults or decorators of a method: rebuild it from
+                        # the new source (the child checks nothing else holds the old one)
+                        ops.append((path, y.name, "addmethod", None, _def_source(seg_new, y)))
+                        continue
+                    return False  # evaluated at import
                 continue
             if isinstance(x, ast.ClassDef):
                 if path is None and False:
@@ -271,6 +281,43 @@ def _data_ops(old_text: str, new_text: str):
     if not body(a.body, b.body, None):
         return None
     return ops
+
+
+def _def_source(text: str, f) -> str:
+    """Source of a function definition including its decorators (which
+    ast.get_source_segment leaves out: the node starts at `def`)."""
+    lines = text.splitlines(True)
+    first = min([d.lineno for d in f.decorator_list] + [f.lineno])
+    return "".join(lines[first - 1:f.end_lineno])
+
+
+def _strip_ann(f):
+    """A copy of function node f without parameter and return annotations."""
+    import ast
+    import copy
+
+    g = copy.deepcopy(f)
+    a = g.args
+    for arg in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
+        if arg is not None:
+            arg.annotation = None
+    g.returns = None
+    return g
+
+
+_NOT_PLAIN = {"property", "staticmethod", "classmethod", "cached_property", "overload", "abstractmethod"}
+
+
+def _replaceable(f) -> bool:
+    """A plain method (decorators, if any, are named calls or names that
+    wrap a function), so the class attribute can be rebuilt from source."""
+    import ast
+
+    for d in f.decorator_list:
+        n = d.func if isinstance(d, ast.Call) else d
+        if not isinstance(n, ast.Name) or n.id in _NOT_PLAIN:
+            return False
+    return True
 
 
 def _dict_like(stmt) -> bool:
@@ -387,6 +434,27 @@ def _method_op(module, cls, name, op, src):
             raise RuntimeError(f"no method {name}")
         delattr(cls, name)
     else:
+        old = cls.__dict__.get(name)
+        if old is not None:
+            # Replacing a method: anything else holding the old object (a
+            # TRANSFORMS entry, a bound method, a copy in a subclass body)
+            # would keep running it.
+            import gc
+
+            gc.unfreeze()  # get_referrers does not see the frozen (pre-fork) objects
+            try:
+                import sqlglot.generator as G
+                G._DISPATCH_CACHE.clear()
+            except Exception:  # noqa: BLE001
+                pass
+            own = [r for r in gc.get_referrers(old)
+                   if isinstance(r, dict) and r.get(name) is old and r.get("__module__") == cls.__module__
+                   and set(r) == set(cls.__dict__)]
+            # live's own code-swap index lists every function object: harmless
+            index = {id(v) for v in (_LIVE or {}).values()}
+            others = [r for r in gc.get_referrers(old) if not any(r is o for o in own) and id(r) not in index]
+            if len(own) != 1 or others:
+                raise RuntimeError(f"{name}: old method still referenced")
         # Compile inside a throwaway class body so zero-argument super() gets
         # a __class__ cell, then point that cell at the real class.
         wrapped = "class __BRTmp:\n" + textwrap.indent(textwrap.dedent(src), "    ")
@@ -408,6 +476,9 @@ def _method_op(module, cls, name, op, src):
             fn = types.FunctionType(inner.__code__, vars(module), name, inner.__defaults__, cells)
             fn.__kwdefaults__ = inner.__kwdefaults__
             fn.__qualname__ = f"{cls.__qualname__}.{name}"
+        for obj in {id(fn): fn, id(inner): inner}.values():
+            if isinstance(obj, types.FunctionType):
+                obj.__qualname__ = f"{cls.__qualname__}.{name}"
         setattr(cls, name, fn)
     try:
         import sqlglot.generator as G
@@ -418,17 +489,18 @@ def _method_op(module, cls, name, op, src):
 
 def _apply_ops(module, ops):
     for path, attr, op, ksrc, vsrc in ops:
+        ns = None  # a namespace copy from the previous op would hold old methods
         cls = module
         for name in path:
             cls = getattr(cls, name)
         if op == "dict2":
             _apply_dict2(cls, attr, ksrc, vsrc)
             continue
-        ns = dict(vars(module))
-        ns.update({k: v for k, v in vars(cls).items()})
         if op in ("addmethod", "delmethod"):
             _method_op(module, cls, attr, op, vsrc)
             continue
+        ns = dict(vars(module))
+        ns.update({k: v for k, v in vars(cls).items()})
         if op == "set":
             stack, seen = list(cls.__subclasses__()), set()
             while stack:

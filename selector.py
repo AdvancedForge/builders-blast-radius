@@ -1466,7 +1466,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             if ops is None:
                 log(f"{commit}: fast live: change outside function bodies and class data")
                 return chosen
-            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=bool(ops))
+            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=True)  # data_ops accounted for every class-level difference
             if sw is None:
                 log(f"{commit}: fast live: change not confined to function bodies")
                 return chosen
@@ -1981,7 +1981,7 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
             ops = fastlive.data_ops(old, sel.patched[f]) if old is not None else None
             if ops is None:
                 return False
-            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=bool(ops))
+            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=True)  # data_ops accounted for every class-level difference
             if sw is None:
                 return False
             swaps += sw
