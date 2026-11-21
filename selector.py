@@ -59,6 +59,11 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 LIVE_TIMEOUT = 25
+# DIAGNOSTIC PROBE (branch probe-no-tpcds only): never select the TPC-DS
+# executor test. The board's missed-commit count then equals the number of
+# practice commits that break it, and simulated time + 300 x misses minus
+# the normal run's simulated time is what it costs us across practice.
+PROBE_DROP_TPCDS = os.environ.get("BR_PROBE_DROP_TPCDS", "1") == "1"
 # The batch must finish in 3 minutes (4.5 in the final); live work stops
 # after this much wall time so a hanging patch cannot get the run rejected.
 import time as _time
@@ -1322,6 +1327,8 @@ def main() -> None:
                 if fingerprint_unchanged(sel, files):
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
+            if PROBE_DROP_TPCDS:
+                keys = {k for k in keys if m.tests[k] != TPCDS_EXEC}
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
             if FAST and chosen and live_allowed():
