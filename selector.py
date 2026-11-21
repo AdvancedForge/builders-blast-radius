@@ -1712,6 +1712,9 @@ _UNSET = object()
 _REVDEPS = None
 
 
+_LOADDEPS = None
+
+
 def deep_modules(sel: "Selector") -> list[str]:
     """Patched modules plus every module that imports them (transitively):
     copies of their data and state derived from it live there."""
@@ -1721,10 +1724,19 @@ def deep_modules(sel: "Selector") -> list[str]:
             _REVDEPS = json.load(open(HERE / "revdeps.json"))
         except OSError:
             _REVDEPS = {}
+    global _LOADDEPS
+    if _LOADDEPS is None:
+        try:  # measured at build: whose fresh import loads each module
+            _LOADDEPS = json.load(open(HERE / "loaddeps.json"))
+        except OSError:
+            _LOADDEPS = {}
     mods = {module_name(f) for f in set(sel.patched) | sel.deleted if f.endswith(".py")}
     out = set(mods)
     for mname in mods:
-        out |= set(_REVDEPS.get(mname, ()))
+        if mname in _LOADDEPS:
+            out |= set(_LOADDEPS[mname])
+        else:
+            out |= set(_REVDEPS.get(mname, ()))
     return sorted(out)
 
 

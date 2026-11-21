@@ -13,12 +13,13 @@ COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY maps/ /app/maps/
-COPY selector.py live_plugin.py tpc_fp.py import_fp.py fastlive.py tools/revdeps.py tools/families.py /app/
+COPY selector.py live_plugin.py tpc_fp.py import_fp.py fastlive.py tools/revdeps.py tools/families.py tools/loaddeps.py /app/
 # Fingerprint of what the TPC-DS executor test computes at the pinned commit.
 RUN cd /opt/sqlglot && PYTHONHASHSEED=0 SKIP_INTEGRATION=0 PYTHONPATH=/opt/sqlglot \
     python /app/tpc_fp.py base /app/tpcds_fp.json && test -s /app/tpcds_fp.json \
  && PYTHONHASHSEED=0 PYTHONPATH=/opt/sqlglot python /app/import_fp.py base /app/import_fp.json \
  && python /app/revdeps.py /opt/sqlglot /app/revdeps.json \
+ && cd /opt/sqlglot && PYTHONPATH=/opt/sqlglot python /app/loaddeps.py /app/loaddeps.json \
  && python /app/families.py /tmp/families.json && mv /tmp/families.json /app/families.json
 RUN chmod -R a+rX /app
 ENV BR_SRC=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
