@@ -12,7 +12,7 @@ RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} \
 COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir -r /tmp/requirements.lock
 
-COPY maps/map.json.gz /app/maps/map.json.gz
+COPY maps/ /app/maps/
 COPY selector.py live_plugin.py tpc_fp.py import_fp.py /app/
 # Fingerprint of what the TPC-DS executor test computes at the pinned commit.
 RUN cd /opt/sqlglot && PYTHONHASHSEED=0 SKIP_INTEGRATION=0 PYTHONPATH=/opt/sqlglot \

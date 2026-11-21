@@ -60,7 +60,9 @@ def live_allowed() -> bool:
 IMPORT_BASE = Path(os.environ.get("BR_IMPORT_BASE", HERE / "import_fp.json"))
 TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_BASE = Path(os.environ.get("BR_TPCDS_BASE", HERE / "tpcds_fp.json"))
-FP_ON = os.environ.get("BR_FP", "0") == "1"  # costs more CPU than it saves on the scorer
+FP_ON = os.environ.get("BR_FP", "1") == "1"
+TPCDS_LINES = Path(os.environ.get("BR_TPCDS_LINES", HERE / "maps" / "tpcds_lines.json.gz"))
+_tpcds_lines = None
 # Code that runs on the data itself, which a data-free fingerprint cannot see.
 DATA_TIME = ("sqlglot/executor/", "sqlglot/helper.py", "sqlglot/time.py", "sqlglot/schema.py",
              "tests/", "sqlglot/__init__.py", "sqlglot/expressions/datatypes.py")
@@ -667,6 +669,9 @@ class Selector:
             loc = self.at_line(path, old_tree, ln, self.key_names(old_lines[ln - 1]))
             self.locs.append(loc); out |= loc
         self._new_lines = new_lines
+        self.touched.setdefault(path, set()).update(removed)
+        for k, _ in added:
+            self.touched[path].update((k - 1, k))
         for k, n in added:
             loc = self.added_line(path, old_tree, new_tree, k, n, self.key_names(new_lines[n - 1]), old_lines)
             self.locs.append(loc); out |= loc
@@ -765,6 +770,7 @@ class Selector:
         self.locs: list[set[int]] = []
         self.patched: dict[str, str] = {}
         self.deleted: set[str] = set()
+        self.touched: dict[str, set[int]] = {}
         self.whole_suite = False
         for fp in parse_patch(patch_text):
             if fp.old and fp.new is None:
@@ -836,6 +842,31 @@ class Selector:
             shutil.rmtree(root, ignore_errors=True)
 
 
+def tpcds_queries(sel: "Selector") -> int | None:
+    """Bitmask of TPC-DS queries whose processing runs a function the patch
+    changes, or None if some change is outside a function (then every query
+    may be affected)."""
+    global _tpcds_lines
+    if _tpcds_lines is None:
+        with gzip.open(TPCDS_LINES, "rt") as fh:
+            _tpcds_lines = json.load(fh)
+    mask = 0
+    for path, lines in sel.touched.items():
+        tree = sel.tree(path)
+        per = _tpcds_lines.get(path, {})
+        for ln in lines:
+            ch = chain(tree, ln)
+            funcs = [n for n in ch if isinstance(n, FUNC)]
+            if not funcs:
+                if not [n for n in ch if isinstance(n, ast.stmt)]:
+                    continue  # outside any statement: blank, comment
+                return None
+            f = funcs[-1]
+            for x in range(start(f), (f.end_lineno or f.lineno) + 1):
+                mask |= per.get(str(x), 0)
+    return mask
+
+
 def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
     """True if the patch leaves every TPC-DS query's transpilation, optimized
     form, plan and generated executor code exactly as at the pinned commit."""
@@ -845,11 +876,20 @@ def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
 
     if not TPCDS_BASE.exists() or any(f.startswith(DATA_TIME) or not f.endswith(".py") for f in files):
         return False
+    try:
+        queries = tpcds_queries(sel)
+    except Exception as e:  # noqa: BLE001
+        log("tpcds query map failed:", type(e).__name__, e)
+        queries = None
+    if queries == 0:
+        return True  # no TPC-DS query runs the changed code
     root = Path(tempfile.mkdtemp(prefix="brf", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", SKIP_INTEGRATION="0",
                    PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        if queries is not None:
+            env["BR_QUERIES"] = ",".join(str(i) for i in range(queries.bit_length()) if queries >> i & 1)
         r = subprocess.run([sys.executable, str(HERE / "tpc_fp.py"), "check", str(TPCDS_BASE)], cwd=root, env=env,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         return r.returncode == 0

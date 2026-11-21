@@ -9,12 +9,13 @@ of Python the executor generates (run over empty tables).
 """
 import hashlib
 import json
+import os
 import re
 import pickle
 import sys
 
 
-def fingerprints():
+def fingerprints(on_query=None):
     from sqlglot import parse_one, transpile
     import sqlglot.executor as E
     import sqlglot.planner as P
@@ -47,9 +48,18 @@ def fingerprints():
 
     P.Plan.__init__ = plan
     empty = {t: [] for t in TPCDS_SCHEMA}
+    only = os.environ.get("BR_QUERIES")
+    only = None if only is None else {int(x) for x in only.split(",") if x}
+    q = -1
     for meta, sql, _ in load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"):
         if not meta.get("execute"):
             continue
+        q += 1
+        if only is not None and q not in only:
+            yield q, None
+            continue
+        if on_query is not None:
+            on_query(q)
         trace.clear()
         try:
             trace.append(transpile(sql, write="duckdb")[0])
@@ -57,20 +67,45 @@ def fingerprints():
             E.execute(expression, schema=TPCDS_SCHEMA, tables=empty)
         except Exception as e:  # noqa: BLE001 - a new error is a difference
             trace.append(f"{type(e).__name__}: {e}")
-        yield hashlib.sha1("\x00".join(sorted(trace)).encode()).hexdigest()
+        yield q, hashlib.sha1("\x00".join(sorted(trace)).encode()).hexdigest()
 
 
 def main():
     mode, path = sys.argv[1], sys.argv[2]
     if mode == "base":
-        json.dump(list(fingerprints()), open(path, "w"))
+        json.dump([fp for _, fp in fingerprints()], open(path, "w"))
+        return 0
+    if mode == "lines":
+        # Which lines each query runs: {file: {line: bitmask of queries}}.
+        import coverage
+        cov = coverage.Coverage(data_file=None, include=["*/sqlglot/*"])
+        cov.start()
+        n = 0
+        for n, _ in fingerprints(on_query=lambda q: cov.switch_context(f"q{q}")):
+            pass
+        cov.stop()
+        data = cov.get_data()
+        out = {}
+        for f in data.measured_files():
+            rel = f[f.rindex("/sqlglot/") + 1:]
+            per = {}
+            for ln, ctxs in (data.contexts_by_lineno(f) or {}).items():
+                mask = 0
+                for c in ctxs:
+                    if c.startswith("q"):
+                        mask |= 1 << int(c[1:])
+                if mask:
+                    per[str(ln)] = mask
+            out[rel] = per
+        json.dump(out, open(path, "w"))
         return 0
     base = json.load(open(path))
-    n = 0
-    for n, fp in enumerate(fingerprints()):
-        if n >= len(base) or fp != base[n]:
+    seen = 0
+    for q, fp in fingerprints():
+        seen += 1
+        if fp is not None and (q >= len(base) or fp != base[q]):
             return 1
-    return 0 if n + 1 == len(base) else 1
+    return 0 if seen == len(base) else 1
 
 
 if __name__ == "__main__":
