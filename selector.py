@@ -47,8 +47,8 @@ HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
 # imported once; each commit forks, swaps the changed function bodies and runs
 # its candidates, costing about the tests' own time.
 FAST = os.environ.get("BR_FAST", "1") == "1"
-SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "3.5"))
-FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "6"))
+SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "1.0"))  # board CPU ~= local (practice: 1.5 s)
+FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "25"))
 SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
@@ -104,6 +104,8 @@ class Map:
         self.classes: dict[str, int] = m["classes"]
         self.closure: dict[str, list[str] | None] = m["closure"]
         self.import_lines: dict[str, set[int]] = {f: set(v) for f, v in m["import"].items()}
+        self.keys: dict[str, int] = m.get("keys", {})
+        self.key_attrs = {k.split("|", 1)[0] for k in self.keys}
         self.all = set(range(len(self.tests)))
         self._by_prefix: dict[str, set[int]] = {}
 
@@ -353,6 +355,7 @@ class Selector:
         self._exp_users: dict[str, set[int] | None] = {}
         self._refs: dict[str, set[int]] = {}
         self._reads_cache: dict[str, set[int] | None] = {}
+        self._replacing = False
         self.import_ok = False  # set once a live import check shows import-time state unchanged
         self._lines: dict[str, list[str]] = {}
 
@@ -566,6 +569,9 @@ class Selector:
                 reads = [self.runtime_reads(n) for n in names] if names else [None]
                 if all(r is not None for r in reads):
                     return users & set().union(*reads)
+            ku = self.entry_key_users(path, tree, ch, ln, self.lines_of(path))
+            if ku is not None:
+                return users & ku
             keys = self.dict_keys(path, ch, ln) | extra_names
             if keys:
                 narrowed: set[int] = set()
@@ -592,6 +598,61 @@ class Selector:
         if names_hint:
             return set()
         return m.importers(path)
+
+    def entry_key_users(self, path, tree, ch, ln, lines) -> set[int] | None:
+        """Tests that looked up the key of the class-level dict entry holding
+        line `ln` (recorded per test in the map), or None if that cannot be
+        relied on: no dict entry, a key that is not a string or enum member,
+        a dict never looked up directly, or a multi-word key with no recorded
+        lookups (those are matched through tries built at import)."""
+        stmt = next((n for n in reversed(ch) if isinstance(n, (ast.Assign, ast.AnnAssign))), None)
+        if stmt is None or stmt.value is None:
+            return None
+        # The outermost dict literal of the assignment that spans the line (the
+        # chain can stop at the target when everything is on one line).
+        dct = next((n for n in ast.walk(stmt.value) if isinstance(n, ast.Dict)
+                    and n.lineno <= ln <= (n.end_lineno or n.lineno)), None)
+        if dct is None:
+            return None
+        names = self.assigned(stmt)
+        if len(names) != 1:
+            return None
+        attr = next(iter(names))
+        if attr not in self.m.key_attrs:
+            return None
+        out: set[int] = set()
+        hit = False
+        for k, v in zip(dct.keys, dct.values):
+            # Every entry on the line: a one-line dict holds several.
+            if k is None:
+                if v.lineno <= ln <= (v.end_lineno or v.lineno):
+                    return None  # a ** splat on the line
+                continue
+            if not (start(k) <= ln <= (v.end_lineno or v.lineno)):
+                continue
+            hit = True
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                rep = "s:" + k.value
+                multi = " " in k.value
+            elif isinstance(k, ast.Attribute) and isinstance(k.value, ast.Name) and k.value.id == "TokenType":
+                rep = f"e:TokenType.{k.attr}"
+                multi = False
+            else:
+                return None
+            idx = self.m.keys.get(f"{attr}|{rep}")
+            if idx is None:
+                if multi:
+                    return None
+                continue
+            out |= self.m.s(idx)
+        if hit and self.runtime_reads(attr) is None:
+            # Also read while modules load (a metaclass deriving other data
+            # from it): the live import check must confirm nothing derived
+            # at import changed, or add the users of what did.
+            self.needs_import_check = True
+        if hit:
+            self.narrowed_attrs.add(attr)
+        return out if hit else None
 
     def dict_keys(self, path: str, ch: list[ast.AST], ln: int) -> set[str]:
         """exp.X names keying the dict entry that holds line `ln`, if any."""
@@ -678,7 +739,9 @@ class Selector:
         self.touched.setdefault(path, set()).update(removed)
         for k, _ in added:
             self.touched[path].update((k - 1, k))
+        removed_set = set(removed)
         for k, n in added:
+            self._replacing = (k - 1) in removed_set
             loc = self.added_line(path, old_tree, new_tree, k, n, self.key_names(new_lines[n - 1]), old_lines)
             self.locs.append(loc); out |= loc
         return out
@@ -695,14 +758,25 @@ class Selector:
         if is_bare_string(nstmts[-1]):
             return set()  # inside a docstring: no effect at runtime
         # Old neighbours that are code: the statement just before and just after.
+        # A line that replaces a removed one needs none: the removed line's own
+        # analysis covers the statement it was part of.
         out: set[int] = set()
-        for cand in (k - 1, k):
+        for cand in (() if self._replacing else (k - 1, k)):
             j = cand
             step = -1 if cand == k - 1 else 1
             while 1 <= j <= len(old_lines) and (not old_lines[j - 1].strip() or old_lines[j - 1].lstrip().startswith("#")):
                 j += step
             if 1 <= j <= len(old_lines):
                 out |= self.at_line(path, old_tree, j, names)
+        # A new or changed entry of a class-level dict: the tests that look up
+        # its key, among the class's users.
+        quals_n = [x.name for x in nch if isinstance(x, ast.ClassDef)]
+        if quals_n and not any(isinstance(x, FUNC + (ast.Lambda,)) for x in nch) and not path.startswith("tests/"):
+            users_n = self.class_users(path, quals_n)
+            if users_n is not None:
+                ku = self.entry_key_users(path, new_tree, nch, n, self._new_lines)
+                if ku is not None:
+                    return users_n & ku
         # A statement added straight into a class body (a new attribute or a
         # new method, which may override one) changes the class for its users.
         ci = max((i for i, x in enumerate(nch) if isinstance(x, ast.ClassDef)), default=None)
@@ -777,6 +851,8 @@ class Selector:
         self.patched: dict[str, str] = {}
         self.deleted: set[str] = set()
         self.touched: dict[str, set[int]] = {}
+        self.needs_import_check = False
+        self.narrowed_attrs: set[str] = set()
         self.whole_suite = False
         for fp in parse_patch(patch_text):
             if fp.old and fp.new is None:
@@ -860,14 +936,16 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             return chosen
     live = [t for t in chosen if t["id"] != TPCDS_EXEC]
     rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
-    if any(t["file"] in HEAVY_TEST_FILES for t in live):
-        return chosen  # DuckDB/pandas class setup: ~1.3-1.6 s of CPU per run
     secs = sum(t["seconds"] for t in live)
     listing = pack_cost([(t["number"], t["seconds"]) for t in chosen])
     after = pack_cost([(t["number"], t["seconds"]) for t in rest])
-    # A run costs about half the recorded seconds; the scorer's CPU is
-    # ~3.5x slower than where those were measured.
-    if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * (0.03 + 0.55 * secs) >= listing - after:
+    heavy = {t["file"] for t in live} & HEAVY_TEST_FILES
+    # Measured: dialect tests use ~0.5 s of CPU per recorded second;
+    # optimizer/executor tests ~1.6 s (recorded with a parallel process pool,
+    # run serially here) plus ~1.3 s of DuckDB class setup per file.
+    heavy_secs = sum(t["seconds"] for t in live if t["file"] in HEAVY_TEST_FILES)
+    est = 0.03 + 0.55 * (secs - heavy_secs) + 1.6 * heavy_secs + 1.3 * len(heavy)
+    if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= listing - after:
         return chosen
     import resource
     import fastlive
@@ -1095,6 +1173,20 @@ def main() -> None:
                 log(f"{commit}: import-time changes {changes[:5]}{'...' if len(changes) > 5 else ''}")
                 sel.import_ok = True
                 keys = sel.commit(text) | extra
+            if sel.needs_import_check:
+                changes = import_changes(sel) if live_allowed() else None
+                if changes is None:
+                    raise Everything("import check failed or unavailable for a dict read at import")
+                # The narrowed dict itself differs in every class that copies
+                # it ({**Parent.FUNCTIONS, ...}); its lookups are already
+                # covered by key. Only other import-time state is derived.
+                changes = [c for c in changes if c.rsplit(".", 1)[-1] not in sel.narrowed_attrs]
+                extra = import_change_users(m, changes)
+                if extra is None:
+                    raise Everything("import-time changes to an untraced class")
+                if changes:
+                    log(f"{commit}: dict entry also changes import-time state {changes[:5]}")
+                keys |= extra
             plan = sel.proxy_plan(keys) if LIVE else {}
             if plan:
                 ids = [m.tests[p] for p in plan]

@@ -63,6 +63,7 @@ def pytest_sessionfinish(session):
             json.dump({k: sorted(v) for k, v in _reads.items()}, f)
         with open(f"{out}.types.{wid}.json", "w") as f:
             json.dump(_dump_types(), f)
+        _dump_keys(out, wid)
 
 
 # Optimizer and executor tests farm work out to spawned process pools, which
@@ -187,3 +188,81 @@ def pytest_collectreport(report):
     c = _cov()
     if c is not None and report.nodeid.endswith(".py"):
         c.switch_context("")
+
+
+# Which keys each test looks up in class-level dicts (FUNCTIONS, KEYWORDS,
+# TRANSFORMS, arg_types, ...), so a change to one dict entry can be traced
+# to the tests that use that key.
+_keys: dict = {}
+
+
+def _keyrepr(k):
+    import enum
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, type):
+        return f"t:{k.__qualname__}"
+    if isinstance(k, enum.Enum):
+        return f"e:{type(k).__name__}.{k.name}"
+    return None
+
+
+class _RecDict(dict):
+    __slots__ = ("_br_attr",)
+
+    def _note(self, k):
+        r = _keyrepr(k)
+        if r is not None:
+            key = _key[0] or "FILE:?"
+            _keys.setdefault(key, set()).add((self._br_attr, r))
+
+    def __getitem__(self, k):
+        self._note(k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, default=None):
+        self._note(k)
+        return dict.get(self, k, default)
+
+    def __contains__(self, k):
+        self._note(k)
+        return dict.__contains__(self, k)
+
+
+def _wrap_dicts():
+    import inspect, sys as _sys
+    seen = set()
+    for mod in list(_sys.modules.values()):
+        if not getattr(mod, "__name__", "").startswith("sqlglot"):
+            continue
+        stack = [v for v in vars(mod).values() if inspect.isclass(v) and v.__module__ == mod.__name__]
+        while stack:
+            c = stack.pop()
+            if id(c) in seen:
+                continue
+            seen.add(id(c))
+            for name, v in list(vars(c).items()):
+                if name.startswith("__"):
+                    continue
+                if type(v) is dict:
+                    w = _RecDict(v)
+                    w._br_attr = name
+                    try:
+                        setattr(c, name, w)
+                    except Exception:
+                        pass
+                elif inspect.isclass(v) and v.__module__ == c.__module__:
+                    stack.append(v)
+
+
+_orig_configure = pytest_configure
+
+
+def pytest_configure(config):  # noqa: F811
+    _orig_configure(config)
+    _wrap_dicts()
+
+
+def _dump_keys(out, wid):
+    with open(f"{out}.keys.{wid}.json", "w") as f:
+        json.dump({k: sorted(f"{a}|{r}" for a, r in v) for k, v in _keys.items()}, f)

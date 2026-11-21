@@ -77,6 +77,7 @@ def invert(pattern):
 
 reads = invert("reads.gw*.json") | invert("reads.main.json")
 classes = invert("reads.types.*.json")
+dict_keys = invert("reads.keys.*.json")
 
 # Modules each test file imports, from a fresh interpreter per file.
 import os, subprocess
@@ -92,5 +93,5 @@ for tf in sorted(set(t.split("::")[0] for t in all_ids)):
     if r.returncode: print("import failed", tf, r.stderr[-300:])
 
 with gzip.open(dest, "wt") as fh:
-    json.dump({"tests": tests, "sets": sets, "lines": lines, "import": imports, "reads": reads, "classes": classes, "closure": closure}, fh, separators=(",", ":"))
+    json.dump({"tests": tests, "sets": sets, "lines": lines, "import": imports, "reads": reads, "classes": classes, "closure": closure, "keys": dict_keys}, fh, separators=(",", ":"))
 print(len(tests), "tests", len(sets), "sets", sum(map(len, lines.values())), "lines")
