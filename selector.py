@@ -967,8 +967,9 @@ class Selector:
             return self.new_file(path)
         old_tree = self.tree(fp.old)
         extra: set[int] = set()
-        if path.startswith("sqlglot/typing/"):
-            # test_typing inspects the metadata itself (e.g. redundant entries)
+        if path.startswith("sqlglot/typing/") and ast.dump(old_tree) != ast.dump(new_tree):
+            # test_typing inspects the metadata itself (e.g. redundant entries);
+            # it reads the module's AST and values, which comments cannot change
             extra = self.m.prefix("tests/test_typing.py::")
         old_head, new_head = old_text.split("\n")[:2], new_text.split("\n")[:2]
         if old_head != new_head and any(re.match(r"^[ \t\f]*#.*?coding[:=]", l) for l in old_head + new_head):
