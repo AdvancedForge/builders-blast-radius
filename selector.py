@@ -59,6 +59,7 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 LIVE_TIMEOUT = 25
+DIFF_MAX = int(os.environ.get("BR_DIFF_MAX", "12"))
 # The batch must finish in 3 minutes (4.5 in the final); live work stops
 # after this much wall time so a hanging patch cannot get the run rejected.
 import time as _time
@@ -1225,22 +1226,23 @@ def tpcds_queries(sel: "Selector") -> int | None:
     return mask
 
 
-def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
-    """True if the patch leaves every TPC-DS query's transpilation, optimized
-    form, plan and generated executor code exactly as at the pinned commit."""
+def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
+    """TPC-DS queries (indices among executed ones) whose transpilation,
+    optimized form, plan or generated executor code the patch changes, up to
+    DIFF_MAX + 1 of them; None if the check cannot be made."""
     import shutil
     import subprocess
     import tempfile
 
     if not TPCDS_BASE.exists() or any(f.startswith(DATA_TIME) or not f.endswith(".py") for f in files):
-        return False
+        return None
     try:
         queries = tpcds_queries(sel)
     except Exception as e:  # noqa: BLE001
         log("tpcds query map failed:", type(e).__name__, e)
         queries = None
     if queries == 0:
-        return True  # no TPC-DS query runs the changed code
+        return []  # no TPC-DS query runs the changed code
     root = Path(tempfile.mkdtemp(prefix="brf", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
@@ -1248,12 +1250,15 @@ def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
                    PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
         if queries is not None:
             env["BR_QUERIES"] = ",".join(str(i) for i in range(queries.bit_length()) if queries >> i & 1)
-        r = subprocess.run([sys.executable, str(HERE / "tpc_fp.py"), "check", str(TPCDS_BASE)], cwd=root, env=env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
-        return r.returncode == 0
+        env["BR_DIFF_MAX"] = str(DIFF_MAX)
+        r = subprocess.run([sys.executable, str(HERE / "tpc_fp.py"), "diff", str(TPCDS_BASE)], cwd=root, env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout.decode().strip().splitlines()[-1])
     except Exception as e:  # noqa: BLE001
         log("fingerprint failed:", type(e).__name__, e)
-        return False
+        return None
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1310,6 +1315,44 @@ def import_change_users(m: "Map", changes: list[str]) -> set[int] | None:
             return None
         out |= users
     return out
+
+
+def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
+    """Run the TPC-DS executor test on only the queries whose fingerprint
+    changed, with the patch swapped in; every other query computes exactly
+    what it did at the pinned commit, so the test passes iff these do."""
+    import fastlive
+
+    files = set(sel.patched) | sel.deleted
+    try:
+        if sel.deleted or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
+            return False
+        fastlive.setup(str(SRC))
+        swaps, data = [], []
+        for f in files:
+            old = sel.text(f)
+            ops = fastlive.data_ops(old, sel.patched[f]) if old is not None else None
+            if ops is None:
+                return False
+            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=bool(ops))
+            if sw is None:
+                return False
+            swaps += sw
+            if ops:
+                data.append((module_name(f), ops))
+        if data:
+            changes = import_changes(sel)
+            attrs = {op[1] for _, ops in data for op in ops}
+            deep = getattr(sel, "import_deep", None) if changes is not None else None
+            if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
+                return False
+        if not fastlive.import_tests({"tests/test_executor.py"}):
+            return False
+        passed = fastlive.run([TPCDS_EXEC], swaps, LIVE_TIMEOUT, data, tpcds=diff)
+        return passed is not None and TPCDS_EXEC in passed
+    except Exception as e:  # noqa: BLE001
+        log(f"{commit}: tpcds verify failed: {type(e).__name__}: {e}")
+        return False
 
 
 def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
@@ -1419,9 +1462,13 @@ def main() -> None:
             tp = next((k for k in keys if m.tests[k] == TPCDS_EXEC), None)
             if FP_ON and tp is not None and live_allowed():
                 files = set(sel.patched) | sel.deleted
-                if fingerprint_unchanged(sel, files):
+                diff = fingerprint_diff(sel, files)
+                if diff == []:
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
+                elif diff is not None and len(diff) <= DIFF_MAX and tpcds_queries_pass(sel, commit, diff):
+                    keys.discard(tp)
+                    log(f"{commit}: TPC-DS {len(diff)} changed queries pass for real, dropping {TPCDS_EXEC}")
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
             if FAST and chosen and live_allowed():

@@ -100,6 +100,18 @@ def main():
         json.dump(out, open(path, "w"))
         return 0
     base = json.load(open(path))
+    if mode == "diff":
+        # Indices (among executed queries) whose fingerprint differs; stops
+        # once more than BR_DIFF_MAX differ.
+        cap = int(os.environ.get("BR_DIFF_MAX", "8"))
+        diff = []
+        for q, fp in fingerprints():
+            if fp is not None and (q >= len(base) or fp != base[q]):
+                diff.append(q)
+                if len(diff) > cap:
+                    break
+        print(json.dumps(diff))
+        return 0
     seen = 0
     for q, fp in fingerprints():
         seen += 1

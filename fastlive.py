@@ -381,8 +381,24 @@ def _restrict_entries(masks: dict[str, int]) -> None:
     TO.load_sql_fixture_pairs = pairs
 
 
+def _restrict_tpcds(queries: list[int]) -> None:
+    """In the child: TestExecutor's TPC-DS test runs only these queries
+    (indices among the queries it executes, as tpc_fp numbers them)."""
+    import tests.test_executor as TE
+
+    orig = TE.TestExecutor.setUpClass.__func__
+
+    def setUpClass(cls):
+        orig(cls)
+        executed = [i for i, (meta, _, _) in enumerate(cls.tpcds_sqls) if meta.get("execute")]
+        cls.tpcds_sqls = [cls.tpcds_sqls[executed[q]] for q in queries]
+
+    TE.TestExecutor.setUpClass = classmethod(setUpClass)
+
+
 def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
-        defer: set[str] | None = None, masks: dict[str, int] | None = None) -> set[str] | None:
+        defer: set[str] | None = None, masks: dict[str, int] | None = None,
+        tpcds: list[int] | None = None) -> set[str] | None:
     """Fork, apply swaps, run the tests; return the node ids that passed."""
     names = {_to_unittest(n): n for n in node_ids}
     r, w = os.pipe()
@@ -403,6 +419,8 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
                 _apply_data(sys.modules[modname], ops)
             if masks:
                 _restrict_entries(masks)
+            if tpcds is not None:
+                _restrict_tpcds(tpcds)
             loader = unittest.TestLoader()
             first, second = unittest.TestSuite(), unittest.TestSuite()
             for name in names:
