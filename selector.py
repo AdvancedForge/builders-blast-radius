@@ -981,16 +981,24 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     secs = sum(t["seconds"] for t in live)
     listing = pack_cost([(t["number"], t["seconds"]) for t in chosen])
     after = pack_cost([(t["number"], t["seconds"]) for t in rest])
-    heavy = {t["file"] for t in live} & HEAVY_TEST_FILES
-    # Measured: dialect tests use ~0.5 s of CPU per recorded second;
-    # optimizer/executor tests ~1.6 s (recorded with a parallel process pool,
-    # run serially here) plus ~1.3 s of DuckDB class setup per file.
-    heavy_secs = sum(t["seconds"] for t in live if t["file"] in HEAVY_TEST_FILES)
-    est = 0.03 + 0.55 * (secs - heavy_secs) + 1.6 * heavy_secs + 1.3 * len(heavy)
+    # Measured CPU per recorded second: dialect tests ~0.55, optimizer tests
+    # ~1.4 (recorded with a parallel pool, run inline here), executor tests
+    # ~0.8 plus ~1.0 s of TPC data loading in setUpClass; importing either
+    # heavy module costs ~0.25 s once per batch.
+    by = {}
+    for t in live:
+        by[t["file"]] = by.get(t["file"], 0.0) + t["seconds"]
+    opt = by.pop("tests/test_optimizer.py", 0.0)
+    exe = by.pop("tests/test_executor.py", 0.0)
+    est = 0.03 + 0.55 * sum(by.values()) + 1.4 * opt + 0.8 * exe + (1.0 if exe else 0.0)
+    import sys as _sys
+    for f, mod in (("tests/test_optimizer.py", "tests.test_optimizer"), ("tests/test_executor.py", "tests.test_executor")):
+        if (opt if "optimizer" in f else exe) and mod not in _sys.modules:
+            est += 0.25
     needs_check = at_import or class_data_change(sel, files)
     if needs_check and getattr(sel, "_import_result", _UNSET) is _UNSET:
         est += 0.75  # the live import check (~0.7 s)
-    if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= listing - after:
+    if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= 0.8 * (listing - after):
         return chosen
     import resource
     import fastlive
@@ -1037,6 +1045,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     c1 = resource.getrusage(resource.RUSAGE_SELF)
     k1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     _u = lambda a, b: b.ru_utime + b.ru_stime - a.ru_utime - a.ru_stime
+    log(f"{commit}: est {est:.2f} listing {listing - after:.2f}")
     log(f"{commit}: fast cpu setup {_u(c0, c_setup):.2f} imports {_u(c_setup, c_imp):.2f} "
         f"swap+fork {_u(c_imp, c1):.2f} child {_u(k0, k1):.2f}")
     if passed is None:
