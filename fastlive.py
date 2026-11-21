@@ -632,6 +632,59 @@ def _restrict_dialects(values: list[str]) -> None:
     TG.Dialects = [d for d in TG.Dialects if d.value in set(values)]
 
 
+_TPC_TABLES = None
+
+
+class _NoConn:
+    def execute(self, *a, **k):
+        return self
+
+    def close(self):
+        pass
+
+
+def _tpc_tables():
+    """In the parent, once: the row tables TestExecutor.setUpClass parses from
+    the TPC-H/TPC-DS csv files (~0.5 s), built without duckdb (connections
+    must not cross a fork). Children reuse them."""
+    global _TPC_TABLES
+    if _TPC_TABLES is None:
+        import types
+        import tests.test_executor as TE
+
+        class _D:
+            pass
+
+        real = TE.duckdb
+        TE.duckdb = types.SimpleNamespace(connect=lambda *a, **k: _NoConn())
+        try:
+            TE.TestExecutor.setUpClass.__func__(_D)
+        finally:
+            TE.duckdb = real
+        _TPC_TABLES = (_D.tpch_tables, _D.tpcds_tables)
+    return _TPC_TABLES
+
+
+def _use_tpc_tables(tables) -> None:
+    """In the child: setUpClass creates the duckdb views but skips parsing the
+    csv rows, taking the parent's tables instead."""
+    import io
+    import tests.test_executor as TE
+
+    orig = TE.TestExecutor.setUpClass.__func__
+
+    def setUpClass(cls):
+        real = TE.open_file
+        TE.open_file = lambda name: io.StringIO("header\n")
+        try:
+            orig(cls)
+        finally:
+            TE.open_file = real
+        cls.tpch_tables, cls.tpcds_tables = tables
+
+    TE.TestExecutor.setUpClass = classmethod(setUpClass)
+
+
 def _restrict_tpcds(queries: list[int]) -> None:
     """In the child: TestExecutor's TPC-DS test runs only these queries
     (indices among the queries it executes, as tpc_fp numbers them)."""
@@ -650,9 +703,17 @@ def _restrict_tpcds(queries: list[int]) -> None:
 def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
         defer: set[str] | None = None, masks: dict[str, int] | None = None,
         tpcds: list[int] | None = None, fixtures: dict[str, str] | None = None,
-        dialects: list[str] | None = None) -> set[str] | None:
-    """Fork, apply swaps, run the tests; return the node ids that passed."""
+        dialects: list[str] | None = None, tpc_cache: bool = False) -> set[str] | None:
+    """Fork, apply swaps, run the tests; return the node ids that passed.
+    tpc_cache: the executor's csv tables may be parsed once in the parent
+    (only when nothing that builds them is patched)."""
     names = {_to_unittest(n): n for n in node_ids}
+    tables = None
+    if tpc_cache and any(n.startswith("tests/test_executor.py::") for n in node_ids):
+        try:
+            tables = _tpc_tables()
+        except Exception:  # noqa: BLE001 - fall back to the test's own loading
+            tables = None
     r, w = os.pipe()
     gc.collect()
     gc.freeze()
@@ -673,6 +734,8 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
                 _patch_fixtures(fixtures)  # before masks, which wrap the loader again
             if masks:
                 _restrict_entries(masks)
+            if tables is not None:
+                _use_tpc_tables(tables)  # before _restrict_tpcds, which wraps it
             if tpcds is not None:
                 _restrict_tpcds(tpcds)
             if dialects is not None:

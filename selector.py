@@ -1231,6 +1231,13 @@ class Selector:
             shutil.rmtree(root, ignore_errors=True)
 
 
+def tpc_cache_ok(sel: "Selector") -> bool:
+    """The executor's csv row tables are the same as at the pinned commit:
+    nothing that parses or holds them is patched."""
+    return not any(f.startswith(("tests/", "sqlglot/executor/")) or f == "sqlglot/helper.py"
+                   for f in set(sel.patched) | sel.deleted)
+
+
 def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> list[dict]:
     """Run `chosen` in-process on the patched code if that is cheaper than
     listing it; return the tests to list."""
@@ -1331,6 +1338,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             return chosen
         c_imp = resource.getrusage(resource.RUSAGE_SELF)
         passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data, defer=HEAVY_TEST_FILES,
+                              tpc_cache=tpc_cache_ok(sel),
                               masks=masks, dialects=mem_dialects)
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
@@ -1820,7 +1828,7 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
                 return False
         if not fastlive.import_tests({"tests/test_executor.py"}):
             return False
-        passed = fastlive.run([TPCDS_EXEC], swaps, LIVE_TIMEOUT, data, tpcds=diff)
+        passed = fastlive.run([TPCDS_EXEC], swaps, LIVE_TIMEOUT, data, tpcds=diff, tpc_cache=tpc_cache_ok(sel))
         return passed is not None and TPCDS_EXEC in passed
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: tpcds verify failed: {type(e).__name__}: {e}")
