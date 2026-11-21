@@ -740,13 +740,23 @@ class Selector:
                 for n in inner:
                     if isinstance(n, COMPOUND):
                         spots.update(range(n.lineno, header_end(n) + 1))
-                if spots & imported or once_per_process(path, ch):
-                    # Runs while sqlglot imports (factories, decorators, metaclasses)
-                    # or once per process (lazy caches): coverage cannot say who
-                    # depends on it and a live child cannot re-run it.
+                if once_per_process(path, ch):
+                    # Lazy caches and dialect loading: global by design, and the
+                    # map credits them only to whichever tests ran them first.
                     self.no_live = True
                     self.needs_import_check = True
                     return self.import_time_users(path)
+                if spots & imported:
+                    # Runs while sqlglot imports (factories, decorator factories):
+                    # what it builds acts at runtime through the closures it
+                    # creates (covered per test) and through class data (the deep
+                    # import check names changed attributes, whose class users are
+                    # added). A live child cannot re-run it.
+                    self.no_live = True
+                    self.needs_import_check = True
+                    self.import_deep_users = True
+                    outer = next(n for n in ch if isinstance(n, FUNC))
+                    return m.span(path, start(outer), outer.end_lineno or outer.lineno)
             for n in inner:
                 if isinstance(n, COMPOUND) or isinstance(n, FUNC + (ast.ClassDef,)):
                     out |= m.span(path, n.lineno, max(n.lineno, header_end(n)))
@@ -1114,6 +1124,7 @@ class Selector:
         self.touched: dict[str, set[int]] = {}
         self.needs_import_check = False
         self.no_live = False
+        self.import_deep_users = False
         self._import_result = _UNSET
         self.import_deep = None
         self.narrowed_attrs: set[str] = set()
@@ -1856,9 +1867,14 @@ def main() -> None:
                 sel.import_ok = True
                 keys = sel.commit(text) | extra
             if sel.needs_import_check:
-                changes = import_changes(sel) if live_allowed() else None
+                changes = import_changes(sel, deep=sel.import_deep_users) if live_allowed() else None
                 if changes is None:
                     raise Everything("import check failed or unavailable for a dict read at import")
+                if sel.import_deep_users:
+                    deep_extra = import_change_users(m, list(sel.import_deep or []))
+                    if deep_extra is None:
+                        raise Everything("import-time code changed data of an untraced class")
+                    keys |= deep_extra
                 # The narrowed dict itself differs in every class that copies
                 # it ({**Parent.FUNCTIONS, ...}); its lookups are already
                 # covered by key. Only other import-time state is derived.
@@ -1887,6 +1903,8 @@ def main() -> None:
                 rest = pack_cost([(t["number"], t["seconds"]) for t in sel_tests if t["id"] != TPCDS_EXEC])
                 if full - rest < 2.5:
                     tp = None
+            if sel.no_live:
+                tp = None  # import-time code changed: the data-free fingerprint can miss its effect
             if FP_ON and tp is not None and live_allowed():
                 files = set(sel.patched) | sel.deleted
                 diff = fingerprint_diff(sel, files)
