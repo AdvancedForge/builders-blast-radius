@@ -1836,6 +1836,43 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
         return False
 
 
+TYPING_TEST = "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata"
+
+
+def typing_check(sel: "Selector", commit: str, chosen: list[dict]) -> list[dict]:
+    """test_typing reads sqlglot/typing sources from disk, so the in-memory
+    live run cannot judge it. When listing it costs a worker's worth, run it
+    for real on the patched tree in a subprocess (~0.3 s CPU)."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    t = next((t for t in chosen if t["id"] == TYPING_TEST), None)
+    if t is None or not live_allowed():
+        return chosen
+    rest = [x for x in chosen if x is not t]
+    gain = pack_cost([(x["number"], x["seconds"]) for x in chosen]) - pack_cost([(x["number"], x["seconds"]) for x in rest])
+    if gain < 1.0:
+        return chosen
+    root = Path(tempfile.mkdtemp(prefix="brt", dir="/tmp"))
+    try:
+        build_tree(SRC, root, sel.patched, sel.deleted)
+        env = dict(os.environ, PYTHONPATH=str(root), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        r = subprocess.run([sys.executable, "-m", "unittest", "-q",
+                            "tests.test_typing.TestTyping.test_no_redundant_expression_metadata"],
+                           cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=LIVE_TIMEOUT)
+        err = r.stderr.decode(errors="replace")
+        if r.returncode == 0 and "Ran 1 test" in err and "OK" in err:
+            log(f"{commit}: test_typing passes on the patched tree, dropping it")
+            return rest
+        log(f"{commit}: test_typing fails or did not run on the patched tree")
+    except Exception as e:  # noqa: BLE001
+        log("typing check failed:", type(e).__name__, e)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    return chosen
+
+
 def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
     """Mirror src into dst with symlinks, writing patched files for real."""
     touched = set(patched) | set(deleted)
@@ -1987,7 +2024,11 @@ def main() -> None:
                 if all(f.startswith("tests/fixtures/") for f in set(sel.patched) | sel.deleted):
                     chosen = fixture_live(sel, m, commit, chosen)
                 else:
-                    chosen = fast_live(sel, m, commit, chosen)
+                    # test_typing is judged separately (typing_check): the
+                    # live run decides the rest as if it were dropped too.
+                    tt = [t for t in chosen if t["id"] == TYPING_TEST]
+                    chosen = fast_live(sel, m, commit, [t for t in chosen if t["id"] != TYPING_TEST]) + tt
+                    chosen = typing_check(sel, commit, chosen)
             heavy = any(t["file"] in HEAVY_TEST_FILES for t in chosen)
             if SMALL and chosen and code_change and not heavy and live_allowed() and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
                 import resource
