@@ -269,6 +269,33 @@ def strip_docstrings(tree: ast.AST) -> ast.AST:
     return tree
 
 
+class _NoneCompare(ast.NodeTransformer):
+    """`x == None` behaves as `x is None` for every type sqlglot compares this
+    way (Expr.__eq__ checks the type first; dialect __eq__ returns False)."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        ops = []
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(right, ast.Constant) and right.value is None:
+                op = ast.Is() if isinstance(op, ast.Eq) else ast.IsNot() if isinstance(op, ast.NotEq) else op
+            ops.append(op)
+        if isinstance(node.left, ast.Constant) and node.left.value is None and len(ops) == 1:
+            ops[0] = ast.Is() if isinstance(ops[0], ast.Eq) else ast.IsNot() if isinstance(ops[0], ast.NotEq) else ops[0]
+        node.ops = ops
+        return node
+
+
+def normalize(tree: ast.AST, path: str) -> ast.AST:
+    """The tree with runtime-irrelevant differences removed: docstrings, and
+    == / != None written for is / is not None (outside the executor's
+    data-time helpers, whose wrappers define their own __eq__)."""
+    tree = strip_docstrings(tree)
+    if not path.startswith("sqlglot/executor/env.py"):
+        tree = _NoneCompare().visit(tree)
+    return tree
+
+
 def module_name(path: str) -> str:
     return path[:-3].replace("/", ".").removesuffix(".__init__")
 
@@ -573,7 +600,7 @@ class Selector:
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
         old_tree = self.tree(fp.old)
-        if ast.dump(strip_docstrings(old_tree)) == ast.dump(strip_docstrings(new_tree)):
+        if ast.dump(normalize(old_tree, path)) == ast.dump(normalize(new_tree, path)):
             return set()
         if fp.new != fp.old:
             return m.importers(fp.old)
