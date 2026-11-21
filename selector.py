@@ -39,6 +39,7 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 LIVE_TIMEOUT = 60
+IMPORT_BASE = Path(os.environ.get("BR_IMPORT_BASE", HERE / "import_fp.json"))
 TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_BASE = Path(os.environ.get("BR_TPCDS_BASE", HERE / "tpcds_fp.json"))
 FP_ON = os.environ.get("BR_FP", "1") == "1"
@@ -309,6 +310,7 @@ class Selector:
         self._exp_users: dict[str, set[int] | None] = {}
         self._refs: dict[str, set[int]] = {}
         self._reads_cache: dict[str, set[int] | None] = {}
+        self.import_ok = False  # set once a live import check shows import-time state unchanged
         self._lines: dict[str, list[str]] = {}
 
     def text(self, rel: str) -> str | None:
@@ -477,11 +479,19 @@ class Selector:
                 return m.span(path, f.lineno, f.end_lineno) | m.span(path, start(f), f.lineno)
             inner = [n for n in ch[inner_fn + 1:] if isinstance(n, ast.stmt)]
             imported = m.import_lines.get(path, ())
-            if not names_hint and path.startswith("sqlglot/") and any(
-                    x in imported for x in range(body_start, f.end_lineno + 1)):
-                # This function runs while sqlglot is imported: breaking it can
-                # break every import.
-                raise Everything(f"import-time code {path}:{ln}")
+            if not names_hint and path.startswith("sqlglot/") and imported and not self.import_ok:
+                # The changed statement, or a block header around it, runs while
+                # sqlglot is imported: breaking it can break every import.
+                spots = {ln}
+                if inner:
+                    last = inner[-1]
+                    end = header_end(last) if isinstance(last, COMPOUND) else (last.end_lineno or last.lineno)
+                    spots.update(range(start(last), end + 1))
+                for n in inner:
+                    if isinstance(n, COMPOUND):
+                        spots.update(range(n.lineno, header_end(n) + 1))
+                if spots & imported:
+                    raise Everything(f"import-time code {path}:{ln}")
             for n in inner:
                 if isinstance(n, COMPOUND) or isinstance(n, FUNC + (ast.ClassDef,)):
                     out |= m.span(path, n.lineno, max(n.lineno, header_end(n)))
@@ -801,6 +811,29 @@ def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
         shutil.rmtree(root, ignore_errors=True)
 
 
+def import_unchanged(sel: "Selector") -> bool:
+    """True if patched sqlglot imports, loads every dialect, and builds the
+    same import-time SQL objects as the pinned commit."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not IMPORT_BASE.exists():
+        return False
+    root = Path(tempfile.mkdtemp(prefix="bri", dir="/tmp"))
+    try:
+        build_tree(SRC, root, sel.patched, sel.deleted)
+        env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
+                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
+        return r.returncode == 0
+    except Exception as e:  # noqa: BLE001
+        log("import check failed:", type(e).__name__, e)
+        return False
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
     """Mirror src into dst with symlinks, writing patched files for real."""
     touched = set(patched) | set(deleted)
@@ -864,7 +897,16 @@ def main() -> None:
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
         try:
-            keys = sel.commit(patch.read_text("utf-8", errors="replace"))
+            text = patch.read_text("utf-8", errors="replace")
+            sel.import_ok = False
+            try:
+                keys = sel.commit(text)
+            except Everything as e:
+                if not str(e).startswith("import-time") or not import_unchanged(sel):
+                    raise
+                log(f"{commit}: import-time state unchanged, selecting normally")
+                sel.import_ok = True
+                keys = sel.commit(text)
             plan = sel.proxy_plan(keys) if LIVE else {}
             if plan:
                 ids = [m.tests[p] for p in plan]

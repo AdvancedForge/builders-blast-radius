@@ -163,3 +163,27 @@ def _dump_types():
                     names.add(f"{m.__module__}:{m.__qualname__}")
         out[k] = sorted(names)
     return out
+
+
+# Code run while pytest imports a test module (module-level parse_one calls,
+# class bodies) belongs to that file's tests, not to sqlglot's own import.
+def _cov():
+    try:
+        import coverage
+        return coverage.Coverage.current()
+    except Exception:
+        return None
+
+
+def pytest_collectstart(collector):
+    import _pytest.python as P
+    if isinstance(collector, P.Module):
+        c = _cov()
+        if c is not None:
+            c.switch_context("COLLECT:" + collector.nodeid)
+
+
+def pytest_collectreport(report):
+    c = _cov()
+    if c is not None and report.nodeid.endswith(".py"):
+        c.switch_context("")

@@ -26,13 +26,21 @@ def skey(keys):
         sindex[t] = len(sets); sets.append(list(t))
     return sindex[t]
 
+all_nodeids = sorted({c.split("|")[0] for c in data.measured_contexts() if c and not c.startswith("COLLECT:")})
+for t in all_nodeids:
+    tkey(t)
 lines, imports = {}, {}
 for path in sorted(data.measured_files()):
     rel = path.removeprefix("/src/")
     per = {}
     imp = []
     for ln, ctxs in (data.contexts_by_lineno(path) or {}).items():
-        ids = [tkey(c.split("|")[0]) for c in ctxs if c]
+        ids = []
+        for c in ctxs:
+            if c.startswith("COLLECT:"):
+                ids += [tkey(t) for t in all_nodeids if t.startswith(c[8:] + "::")]
+            elif c:
+                ids.append(tkey(c.split("|")[0]))
         if ids:
             per[str(ln)] = skey(ids)
         if "" in ctxs:
