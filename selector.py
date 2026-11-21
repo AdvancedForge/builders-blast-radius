@@ -34,8 +34,17 @@ HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "maps" / "map.json.gz"))
+LIVE = os.environ.get("BR_LIVE", "0") == "1"  # live proxies cost more CPU than they save
 MAX_WORKERS = 8
 WORKER_COST = 2.0
+
+LIVE_TIMEOUT = 60
+# Expensive test -> cheap test that runs the same code on the same queries.
+PROXIES = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tests/test_optimizer.py::TestOptimizer::test_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": "tests/test_optimizer.py::TestOptimizer::test_tpch",
+}
 
 PYTEST_CONFIG = {"setup.cfg", "pyproject.toml", "tox.ini", "pytest.ini", "conftest.py", "tests/conftest.py"}
 
@@ -434,6 +443,8 @@ class Selector:
         if old_text is None:
             old_text = ""
         new_text, removed, added = apply(old_text, fp)
+        if fp.new is not None:
+            self.patched[fp.new] = new_text
         if fp.new is None:  # deleted
             return m.importers(path)
         try:
@@ -452,9 +463,11 @@ class Selector:
         new_lines = new_text.split("\n")
         out: set[int] = set()
         for ln in removed:
-            out |= self.at_line(path, old_tree, ln, self.key_names(old_lines[ln - 1]))
+            loc = self.at_line(path, old_tree, ln, self.key_names(old_lines[ln - 1]))
+            self.locs.append(loc); out |= loc
         for k, n in added:
-            out |= self.added_line(path, old_tree, new_tree, k, n, self.key_names(new_lines[n - 1]), old_lines)
+            loc = self.added_line(path, old_tree, new_tree, k, n, self.key_names(new_lines[n - 1]), old_lines)
+            self.locs.append(loc); out |= loc
         return out
 
     def added_line(self, path, old_tree, new_tree, k, n, names, old_lines) -> set[int]:
@@ -511,7 +524,15 @@ class Selector:
         for p in {fp.old, fp.new} - {None}:
             idx = m.reads.get(p)
             if idx is not None:
-                out |= m.s(idx)
+                readers = m.s(idx)
+                # The executor's setUpClass loads both TPC sets for the whole
+                # class; only the tests named for a set use it.
+                for marker, tag in (("tpc-h", "tpch"), ("tpc-ds", "tpcds")):
+                    if f"/{marker}/" in p:
+                        readers = {k for k in readers if not m.tests[k].startswith("tests/test_executor.py::")
+                                   or m.tests[k].endswith(tag) or m.tests[k].rsplit("_", 1)[-1] == tag}
+                self.locs.append(readers)
+                out |= readers
             elif p.startswith("tests/"):
                 base = os.path.basename(p)
                 for tf in m.closure:
@@ -522,7 +543,18 @@ class Selector:
 
     def commit(self, patch_text: str) -> set[int]:
         out: set[int] = set()
+        self.locs: list[set[int]] = []
+        self.patched: dict[str, str] = {}
+        self.deleted: set[str] = set()
+        self.whole_suite = False
         for fp in parse_patch(patch_text):
+            if fp.old and fp.new is None:
+                self.deleted.add(fp.old)
+            if fp.old != fp.new and fp.old:
+                self.deleted.add(fp.old)
+            if fp.new and not fp.new.endswith(".py"):
+                base = self.text(fp.old) if fp.old else ""
+                self.patched[fp.new] = apply(base or "", fp)[0]
             path = fp.path
             if not path:
                 continue
@@ -537,6 +569,83 @@ class Selector:
             else:
                 out |= self.data_file(fp)
         return out
+
+    # -- live proxies
+
+    def proxy_plan(self, keys: set[int]) -> dict[int, list[int]]:
+        """proxy test -> expensive tests it may stand in for in this commit.
+
+        A proxy stands in only if every changed place that reaches the
+        expensive test also reaches the proxy, so the proxy runs the change."""
+        plan: dict[int, list[int]] = {}
+        idx = {t: i for i, t in enumerate(self.m.tests)}
+        for exp_id, proxy_id in PROXIES.items():
+            x, p = idx.get(exp_id), idx.get(proxy_id)
+            if x is None or p is None or x not in keys:
+                continue
+            if not self.locs or any(x in loc and p not in loc for loc in self.locs):
+                continue
+            plan.setdefault(p, []).append(x)
+        return plan
+
+    def run_live(self, node_ids: list[str]) -> set[str] | None:
+        """Run tests on the patched tree; return the ids that passed, or None."""
+        import shutil
+        import subprocess
+        import tempfile
+
+        root = Path(tempfile.mkdtemp(prefix="brt", dir="/tmp"))
+        try:
+            build_tree(SRC, root, self.patched, self.deleted)
+            out = root / ".live.json"
+            env = dict(os.environ, PYTHONPATH=f"{root}{os.pathsep}{HERE}", SKIP_INTEGRATION="0",
+                       BR_LIVE_OUT=str(out), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+            cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "live_plugin",
+                   "-o", "addopts=", *node_ids]
+            r = subprocess.run(cmd, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               timeout=LIVE_TIMEOUT)
+            if not out.exists():
+                log("live run wrote nothing:", r.stderr[-400:].decode(errors="replace"))
+                return None
+            res = json.loads(out.read_text())
+            return {n for n in node_ids if n in res["seen"] and n not in res["failed"]} if not any(
+                f == "<collect>" or "::" not in f for f in res["failed"]) else set()
+        except Exception as e:  # noqa: BLE001
+            log("live run failed:", type(e).__name__, e)
+            return None
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
+    """Mirror src into dst with symlinks, writing patched files for real."""
+    touched = set(patched) | set(deleted)
+    dirs = {str(Path(p).parent) for p in touched}
+    need = set()
+    for d in dirs:
+        parts = Path(d).parts
+        for i in range(len(parts) + 1):
+            need.add(str(Path(*parts[:i])) if i else ".")
+
+    def walk(rel: str):
+        s = src / rel if rel != "." else src
+        d = dst / rel if rel != "." else dst
+        d.mkdir(exist_ok=True)
+        names = set(os.listdir(s)) if s.is_dir() else set()
+        prefix = "" if rel == "." else rel + "/"
+        names |= {p[len(prefix):].split("/")[0] for p in patched if p.startswith(prefix)}
+        for name in names:
+            r = prefix + name
+            if r in deleted and r not in patched:
+                continue
+            if r in patched:
+                (d / name).write_text(patched[r], "utf-8")
+            elif r in need or (r.rstrip("/") in need):
+                walk(r)
+            else:
+                os.symlink(s / name, d / name)
+
+    walk(".")
 
 
 # ------------------------------------------------------------------------ output
@@ -572,6 +681,14 @@ def main() -> None:
         commit = patch.stem
         try:
             keys = sel.commit(patch.read_text("utf-8", errors="replace"))
+            plan = sel.proxy_plan(keys) if LIVE else {}
+            if plan:
+                ids = [m.tests[p] for p in plan]
+                passed = sel.run_live(ids)
+                log(f"{commit}: proxies {ids} passed={passed}")
+                for p, xs in plan.items():
+                    if passed is not None and m.tests[p] in passed:
+                        keys -= {p, *xs}
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
         except Everything as e:
             log(f"{commit}: everything ({e})")

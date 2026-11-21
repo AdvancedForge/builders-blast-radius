@@ -8,7 +8,7 @@ COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} && chmod -R a+rX /opt/sqlglot
 
 COPY maps/map.json.gz /app/maps/map.json.gz
-COPY selector.py /app/selector.py
+COPY selector.py live_plugin.py /app/
 RUN chmod -R a+rX /app
 ENV BR_SRC=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]
