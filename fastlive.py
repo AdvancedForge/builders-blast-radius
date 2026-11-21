@@ -159,6 +159,20 @@ def data_ops(old_text: str, new_text: str):
             ast.dump(d) for d in f.decorator_list) + (ast.dump(f.returns) if f.returns else "") + f.name
 
     def body(xs, ys, path):
+        if path and len(xs) != len(ys):
+            # Methods added to or removed from a class body (everything else
+            # must line up once those are set aside).
+            fx = {n.name: n for n in xs if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            fy = {n.name: n for n in ys if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            gone, new = set(fx) - set(fy), set(fy) - set(fx)
+            if not gone and not new:
+                return False
+            for name in sorted(gone):
+                ops.append((path, name, "delmethod", None, None))
+            for name in sorted(new):
+                ops.append((path, name, "addmethod", None, ast.get_source_segment(seg_new, fy[name])))
+            xs = [n for n in xs if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in gone)]
+            ys = [n for n in ys if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in new)]
         if len(xs) != len(ys):
             return False
         for x, y in zip(xs, ys):
@@ -262,6 +276,45 @@ def _apply_data(module, ops):
 DERIVED = {"arg_types": {"required_args"}}
 
 
+def _method_op(module, cls, name, op, src):
+    """Add a method (zero-argument super() bound to the real class) or remove
+    one, then drop generator dispatch tables built lazily from methods."""
+    import textwrap
+
+    if op == "delmethod":
+        if name not in cls.__dict__:
+            raise RuntimeError(f"no method {name}")
+        delattr(cls, name)
+    else:
+        # Compile inside a throwaway class body so zero-argument super() gets
+        # a __class__ cell, then point that cell at the real class.
+        wrapped = "class __BRTmp:\n" + textwrap.indent(textwrap.dedent(src), "    ")
+        tmp = {}
+        exec(compile(wrapped, module.__file__, "exec"), vars(module), tmp)
+        fn = tmp["__BRTmp"].__dict__[name]
+        if isinstance(fn, (staticmethod, classmethod)):
+            raise RuntimeError("static/class method")
+        inner = fn
+        while hasattr(inner, "__wrapped__"):
+            inner = inner.__wrapped__
+        if not isinstance(inner, types.FunctionType):
+            raise RuntimeError("unsupported method wrapper")
+        if "__class__" in inner.__code__.co_freevars:
+            if inner is not fn:
+                raise RuntimeError("decorated method using super()")
+            cells = tuple(types.CellType(cls) if v == "__class__" else c
+                          for v, c in zip(inner.__code__.co_freevars, inner.__closure__ or ()))
+            fn = types.FunctionType(inner.__code__, vars(module), name, inner.__defaults__, cells)
+            fn.__kwdefaults__ = inner.__kwdefaults__
+            fn.__qualname__ = f"{cls.__qualname__}.{name}"
+        setattr(cls, name, fn)
+    try:
+        import sqlglot.generator as G
+        G._DISPATCH_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _apply_ops(module, ops):
     for path, attr, op, ksrc, vsrc in ops:
         cls = module
@@ -269,6 +322,9 @@ def _apply_ops(module, ops):
             cls = getattr(cls, name)
         ns = dict(vars(module))
         ns.update({k: v for k, v in vars(cls).items()})
+        if op in ("addmethod", "delmethod"):
+            _method_op(module, cls, attr, op, vsrc)
+            continue
         if op == "set":
             setattr(cls, attr, eval(vsrc, ns))
             continue
@@ -320,18 +376,46 @@ def swaps_for(rel: str, old_text: str, new_text: str, allow_bodies: bool = False
     b: list = []
     _codes(old, -1, a)
     _codes(new, -1, b)
-    if len(a) != len(b):
+    # Pair code objects by qualified name (and order among equal names), so
+    # methods added or removed elsewhere do not shift the pairing. Code that
+    # exists on one side only must belong to such a method (data_ops applies it).
+    from collections import defaultdict
+
+    def by_name(items):
+        d = defaultdict(list)
+        for i, (c, p) in enumerate(items):
+            d[c.co_qualname].append(i)
+        return d
+
+    na, nb = by_name(a), by_name(b)
+    one_sided = set(na) ^ set(nb)
+    if one_sided and not allow_bodies:
         return None
+    pairs = []
+    for q in na:
+        if q in one_sided:
+            continue
+        if len(na[q]) != len(nb[q]):
+            return None
+        pairs += list(zip(na[q], nb[q]))
+    for q in one_sided:
+        # e.g. "ClickHouseGenerator.trycast_sql" or something nested in it
+        if "." not in q:
+            return None
     changed = set()
-    for i, ((oc, op), (nc, np_)) in enumerate(zip(a, b)):
-        if op != np_ or oc.co_qualname != nc.co_qualname:
+    for i, j in pairs:
+        oc, nc = a[i][0], b[j][0]
+        pa = a[a[i][1]][0].co_qualname if a[i][1] >= 0 else None
+        pb = b[b[j][1]][0].co_qualname if b[j][1] >= 0 else None
+        if pa != pb:
             return None
         if _own(oc) != _own(nc):
             if not (oc.co_flags & inspect.CO_NEWLOCALS):
-                if allow_bodies and op >= 0:
+                if allow_bodies and a[i][1] >= 0:
                     continue  # a class body (not the module): data_ops applies it
                 return None  # a module or class body: data built at import
             changed.add(i)
+    pair_of = dict(pairs)
     # A function embeds its nested functions' code: swap every enclosing function too.
     todo = set(changed)
     for i in changed:
@@ -342,7 +426,7 @@ def swaps_for(rel: str, old_text: str, new_text: str, allow_bodies: bool = False
     live = _live_index()
     out = []
     for i in sorted(todo):
-        oc, nc = a[i][0], b[i][0]
+        oc, nc = a[i][0], b[pair_of[i]][0]
         funcs = live.get((path, oc.co_qualname, oc.co_firstlineno), [])
         for f in funcs:
             if len(f.__code__.co_freevars) != len(nc.co_freevars):
