@@ -42,6 +42,7 @@ LIVE = os.environ.get("BR_LIVE", "0") == "1"  # live proxies cost more CPU than 
 SMALL = os.environ.get("BR_SMALL", "0") == "1"
 # Importing these pulls in DuckDB and pandas and sets up process pools: a live
 # run costs 1.3-3 s of CPU, no better than listing.
+SOURCE_READERS = {"tests/test_typing.py", "tests/test_docs.py", "tests/test_sqlglotc.py"}
 HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
 # In-process live runs (fastlive.py): pinned sqlglot and test modules are
 # imported once; each commit forks, swaps the changed function bodies and runs
@@ -483,7 +484,20 @@ class Selector:
                 out |= self.m.prefix("tests/test_typing.py::")
         return out
 
-    def import_time_users(self, path: str) -> set[int]:
+    def broken_module(self, path: str) -> set[int]:
+        """A sqlglot module that no longer imports (removed or a syntax error):
+        exactly the tests that import it, directly, through a module importing
+        it, or lazily via a class defined there, fail. Plus the tests that list
+        modules from the source tree."""
+        self.no_live = True
+        out = self.import_time_users(path, broken=True)
+        for tf in ("tests/test_typing.py::", "tests/test_sqlglotc.py::"):
+            out |= self.m.prefix(tf)
+        if not out:
+            raise Everything(f"no recorded importers of {path}")
+        return out
+
+    def import_time_users(self, path: str, broken: bool = False) -> set[int]:
         """Everything that imports `path` or a module importing it, plus the
         users of every class those modules define."""
         global _REVDEPS
@@ -494,6 +508,13 @@ class Selector:
                 _REVDEPS = {}
         mod = module_name(path)
         mods = {mod} | set(_REVDEPS.get(mod, ()))
+        if broken:
+            # A test module importing it at collection errors, and a collection
+            # error stops the whole pytest run: every test fails.
+            rels = {r for n in mods for r in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py")}
+            for tf, cm in self.m.closure.items():
+                if cm is None or rels & set(cm) or tf in rels:
+                    raise Everything(f"{path} breaks collection of {tf}")
         out: set[int] = set()
         for mname in mods:
             for rel in (mname.replace(".", "/") + ".py", mname.replace(".", "/") + "/__init__.py"):
@@ -932,13 +953,13 @@ class Selector:
             self.patched[fp.new] = new_text
         if fp.new is None or (fp.old and fp.new != fp.old):  # deleted or renamed
             if path.startswith("sqlglot/"):
-                raise Everything(f"module removed: {path}")  # dialects load lazily from everywhere
+                return self.broken_module(path)
             return m.importers(path)
         try:
             new_tree = ast.parse(new_text.encode("utf-8"))
         except (SyntaxError, ValueError):
             if path.startswith("sqlglot/"):
-                raise Everything(f"syntax error in {path}")  # dialects load lazily from everywhere
+                return self.broken_module(path)
             return m.importers(path) if fp.old else set()
         if not fp.old or old_text == "":
             return self.new_file(path)
@@ -1124,6 +1145,7 @@ class Selector:
         self.touched: dict[str, set[int]] = {}
         self.needs_import_check = False
         self.no_live = False
+        self.import_failed = False
         self.import_deep_users = False
         self._import_result = _UNSET
         self.import_deep = None
@@ -1216,8 +1238,11 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     # Code that runs at import built data the swap cannot rebuild: such
     # changes need the import check to show no derived state differs.
     at_import = any(lines & m.import_lines.get(path, set()) for path, lines in sel.touched.items())
-    live = [t for t in chosen if t["id"] != TPCDS_EXEC]
-    rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
+    # Tests that read sqlglot source from disk (or docstrings) see the pinned
+    # files, not the in-memory swap: never judge them live.
+    stay = lambda t: t["id"] == TPCDS_EXEC or t["file"] in SOURCE_READERS  # noqa: E731
+    live = [t for t in chosen if not stay(t)]
+    rest = [t for t in chosen if stay(t)]
     # check_file tests run only the fixture entries that reach the change.
     masks = {}
     for t in live:
@@ -1656,6 +1681,7 @@ def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", SKIP_INTEGRATION="0",
                    PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        log(f"tpcds queries {bin(queries).count('1') if queries is not None else 'all'}")
         if queries is not None:
             env["BR_QUERIES"] = ",".join(str(i) for i in range(queries.bit_length()) if queries >> i & 1)
         env["BR_DIFF_MAX"] = str(DIFF_MAX)
@@ -1715,6 +1741,7 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         if r.returncode != 0:
+            sel.import_failed = r.returncode == 1  # the patched tree does not import (not a timeout)
             return None
         lines = [l for l in r.stdout.decode().split("\n") if l]
         sel.import_deep = [l[5:] for l in lines if l.startswith("deep|")]
@@ -1725,6 +1752,19 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         return None
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def import_failure_users(sel: "Selector") -> set[int]:
+    """The patched tree fails to import. The failure starts in a patched
+    module (nothing else changed) and reaches only modules importing it, so
+    every affected test imports a patched module or one of its importers."""
+    out: set[int] = set()
+    for f in set(sel.patched) | sel.deleted:
+        if f.startswith("sqlglot/") and f.endswith(".py"):
+            out |= sel.import_time_users(f, broken=True)
+    for tf in ("tests/test_typing.py::", "tests/test_sqlglotc.py::"):
+        out |= sel.m.prefix(tf)
+    return out
 
 
 def import_change_users(m: "Map", changes: list[str]) -> set[int] | None:
@@ -1866,6 +1906,8 @@ def main() -> None:
                     raise
                 changes = import_changes(sel)
                 extra = import_change_users(m, changes) if changes is not None else None
+                if changes is None and sel.import_failed:
+                    extra = import_failure_users(sel)
                 if extra is None:
                     raise
                 log(f"{commit}: import-time changes {changes[:5]}{'...' if len(changes) > 5 else ''}")
@@ -1873,6 +1915,13 @@ def main() -> None:
                 keys = sel.commit(text) | extra
             if sel.needs_import_check:
                 changes = import_changes(sel, deep=sel.import_deep_users) if live_allowed() else None
+                if changes is None and sel.import_failed:
+                    # A module no longer imports: only its importers can see it.
+                    log(f"{commit}: import fails, selecting importers of the patched modules")
+                    keys |= import_failure_users(sel)
+                    sel.no_live = True
+                    changes = []
+                    sel.import_deep_users = False
                 if changes is None:
                     raise Everything("import check failed or unavailable for a dict read at import")
                 if sel.import_deep_users:
@@ -1906,6 +1955,7 @@ def main() -> None:
                 sel_tests = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
                 full = pack_cost([(t["number"], t["seconds"]) for t in sel_tests])
                 rest = pack_cost([(t["number"], t["seconds"]) for t in sel_tests if t["id"] != TPCDS_EXEC])
+                log(f"{commit}: TPC-DS gain {full - rest:.2f}")
                 if full - rest < 2.5:
                     tp = None
             if sel.no_live:
