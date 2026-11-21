@@ -239,6 +239,30 @@ def data_ops(old_text: str, new_text: str):
 def _apply_data(module, ops):
     """In the child: apply data ops to the live classes (and to subclass
     copies of a changed dict that still hold the old entry)."""
+    _apply_ops(module, ops)
+    # Expr.__init_subclass__ derives required_args from arg_types at class
+    # creation; rebuild it for every class whose arg_types changed.
+    for path, attr, *_ in ops:
+        if attr != "arg_types":
+            continue
+        cls = module
+        for name in path:
+            cls = getattr(cls, name)
+        stack, seen = [cls], set()
+        while stack:
+            c = stack.pop()
+            if id(c) in seen:
+                continue
+            seen.add(id(c))
+            stack.extend(c.__subclasses__())
+            if isinstance(getattr(c, "arg_types", None), dict):
+                c.required_args = {k for k, v in c.arg_types.items() if v}
+
+
+DERIVED = {"arg_types": {"required_args"}}
+
+
+def _apply_ops(module, ops):
     for path, attr, op, ksrc, vsrc in ops:
         cls = module
         for name in path:

@@ -1075,6 +1075,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             # under other names) cannot be patched in: it must not differ.
             changes = import_changes(sel, deep=True)
             attrs = {op[1] for _, ops in data for op in ops}
+            attrs |= {d for a in list(attrs) for d in fastlive.DERIVED.get(a, ())}
             deep = getattr(sel, "import_deep", None) if changes is not None else None
             if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
                 log(f"{commit}: fast live: class data feeds import-time state")
@@ -1457,6 +1458,7 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
         if data:
             changes = import_changes(sel, deep=True)
             attrs = {op[1] for _, ops in data for op in ops}
+            attrs |= {d for a in list(attrs) for d in fastlive.DERIVED.get(a, ())}
             deep = getattr(sel, "import_deep", None) if changes is not None else None
             if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
                 return False
