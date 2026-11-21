@@ -1447,6 +1447,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
         est += 0.75  # the live import check (~0.7 s)
     if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= 0.8 * (listing - after):
         log(f"{commit}: fast skip: cost est {est:.2f} secs {secs:.1f} vs listing {listing - after:.2f}")
+        DIAG_SKIP.add(commit)
         return chosen
     import resource
     import fastlive
@@ -2136,6 +2137,25 @@ def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str])
 
 DIAG_OUT: list = []
 DIAG = {"waste": 0.0, "big": 0, "unmeasured": 0}
+DIAG_SKIP: set = set()
+DIAG_PER: list = []  # (waste, area, heavy, skipped)
+HEAVY_CODE = {"tests/test_executor.py::TestExecutor::test_execute_tpcds": 1,
+              "tests/test_parser.py::TestParser::test_max_nodes": 2,
+              "tests/test_executor.py::TestExecutor::test_execute_tpch": 3,
+              "tests/test_executor.py::TestExecutor::test_optimized_tpch": 3,
+              "tests/test_generator.py::TestGenerator::test_generator_memory": 3}
+
+
+def diag_area(files) -> int:
+    """0 parser, 1 generator, 2 dialects, 3 optimizer, 4 expressions,
+    5 executor, 6 tests, 7 other sqlglot."""
+    py = sorted(f for f in files if f.startswith("sqlglot/") and f.endswith(".py"))
+    f = py[0] if py else (sorted(files)[0] if files else "")
+    for i, pre in enumerate(("sqlglot/pars", "sqlglot/generat", "sqlglot/dialects/", "sqlglot/optimizer/",
+                             "sqlglot/expressions/", "sqlglot/executor/", "tests/")):
+        if f.startswith(pre):
+            return i
+    return 7
 
 
 def _cost(ws, ms):
@@ -2153,7 +2173,14 @@ def diag_measure(sel, commit, chosen, workers, every) -> None:
     if len(chosen) >= 1600:
         DIAG["unmeasured"] += 1
         return
-    DIAG_JOBS.append((sum(t["seconds"] for t in chosen), commit, (dict(sel.patched), set(sel.deleted)), chosen, workers))
+    ids = {t["id"] for t in chosen}
+    heavy = max([HEAVY_CODE.get(i, 0) for i in ids] + [0])
+    if 1 in [HEAVY_CODE.get(i, 0) for i in ids]:
+        heavy = 1
+    elif 2 in [HEAVY_CODE.get(i, 0) for i in ids]:
+        heavy = 2
+    attrs = (diag_area(set(sel.patched) | set(sel.deleted)), heavy, int(commit in DIAG_SKIP))
+    DIAG_JOBS.append((sum(t["seconds"] for t in chosen), commit, (dict(sel.patched), set(sel.deleted)), chosen, workers, attrs))
 
 
 def diag_run_all(every) -> None:
@@ -2170,7 +2197,7 @@ def diag_run_all(every) -> None:
     running = []
 
     def finish(job, root, proc, killed):
-        _, commit, sel, chosen, workers = job
+        _, commit, sel, chosen, workers, attrs = job
         out = root / ".live.json"
         ok = not killed and out.exists()
         if ok:
@@ -2183,6 +2210,7 @@ def diag_run_all(every) -> None:
             waste = max(0, _cost(workers, ms) - ideal) / 1000
             DIAG["waste"] += waste
             DIAG["big"] += waste >= 3
+            DIAG_PER.append((waste,) + attrs)
             log(f"diag: {commit} waste {waste:.2f} ({len(failing)} failing of {len(chosen)})")
         else:
             DIAG["unmeasured"] += 1
@@ -2226,7 +2254,19 @@ def diag_finish(every) -> None:
     print every line. Simulated total = normal total + V ms."""
     diag_run_all(every)
     ms = {t["number"]: round(t["seconds"] * 1000) for t in every}
-    v = min(2047, round(10 * DIAG["waste"])) + (min(31, DIAG["big"]) << 11) + (min(31, DIAG["unmeasured"]) << 16)
+    # v3: each run picks page A or B at random (the board shows all 3 runs).
+    big = sorted((d for d in DIAG_PER if d[0] >= 3), key=lambda d: -d[0])[:3]
+    big += [(0.0, 0, 0, 0)] * (3 - len(big))
+    small = sum(d[0] for d in DIAG_PER if d[0] < 3)
+    page = int(os.environ.get("BR_DIAG_PAGE", os.urandom(1)[0] & 1))
+    if page == 0:  # A: big wastes (whole s, <=31 each) and small-waste total (whole s)
+        # small total in 2 s units first, then bigs largest..smallest (smallest
+        # value in the highest digit keeps the marker total low)
+        payload = min(31, round(small / 2)) + sum(min(31, round(b[0])) << (5 * (i + 1)) for i, b in enumerate(big))
+    else:  # B: per big commit area (3 bits) + heavy (2) + live skipped (1)
+        payload = sum((b[1] + (b[2] << 3) + (b[3] << 5)) << (6 * i) for i, b in enumerate(big))
+    v = page + 2 * payload
+    log(f"diag: page {page} big {big} small {small:.2f} V={v}")
     log(f"diag: V={v} waste={DIAG['waste']:.2f} big={DIAG['big']} unmeasured={DIAG['unmeasured']}")
     left = v
     hosts = []
