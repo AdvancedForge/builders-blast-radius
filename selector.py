@@ -452,6 +452,25 @@ class Selector:
                     idx = self.m.keys.get(f"EXPRESSION_METADATA|t:{k.__qualname__}")
                     if idx is not None:
                         out |= self.m.s(idx)
+            # A test reads a dialect's metadata through that dialect, so it
+            # must have used one whose family includes this typing module.
+            if _ENTRIES is None:
+                entry_mask(self, "")
+            fams = families() if _ENTRIES else {}
+            probe = "sqlglot/dialects/" + os.path.basename(path)
+            dialects = {d for d, files in fams.items() if probe in files or path in files}
+            if fams and dialects:
+                users: set[int] = set()
+                for d in dialects:
+                    mod = f"sqlglot.dialects.{d}:" if d else None
+                    if mod is None:
+                        users = None
+                        break
+                    for q, idx in self.m.classes.items():
+                        if q.startswith(mod):
+                            users |= self.m.s(idx)
+                if users is not None:
+                    out &= users
             self.needs_import_check = True  # anything derived from it at import
             self.narrowed_attrs.add("EXPRESSION_METADATA")
             return out
