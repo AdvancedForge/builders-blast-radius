@@ -51,7 +51,7 @@ FAST = os.environ.get("BR_FAST", "1") == "1"
 # practice commits mostly break what they touch (run 23bb751: -8.9 s
 # simulated, +11.5 s CPU). Off by default; light function-body runs stay.
 FAST_DATA = os.environ.get("BR_FAST_DATA", "1") == "1"
-FAST_HEAVY = os.environ.get("BR_FAST_HEAVY", "0") == "1"
+FAST_HEAVY = os.environ.get("BR_FAST_HEAVY", "1") == "1"  # the cost estimate prices heavy files
 SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "1.0"))  # board CPU ~= local (practice: 1.5 s)
 FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "25"))
 SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
@@ -1003,6 +1003,8 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             if mk is not None:
                 masks[t["id"]] = mk
     if not FAST_HEAVY and any(t["file"] in HEAVY_TEST_FILES and t["id"] not in masks for t in live):
+        log(f"{commit}: fast skip: unmasked heavy " + ",".join(t["id"].split("::")[-1] for t in live
+                                                                if t["file"] in HEAVY_TEST_FILES and t["id"] not in masks)[:200])
         return chosen
     if not FAST_DATA and (at_import or class_data_change(sel, files)):
         return chosen
@@ -1031,6 +1033,7 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     if needs_check and getattr(sel, "_import_result", _UNSET) is _UNSET:
         est += 0.75  # the live import check (~0.7 s)
     if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= 0.8 * (listing - after):
+        log(f"{commit}: fast skip: cost est {est:.2f} secs {secs:.1f} vs listing {listing - after:.2f}")
         return chosen
     import resource
     import fastlive
