@@ -39,6 +39,12 @@ MAX_WORKERS = 8
 WORKER_COST = 2.0
 
 LIVE_TIMEOUT = 60
+TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_BASE = Path(os.environ.get("BR_TPCDS_BASE", HERE / "tpcds_fp.json"))
+FP_ON = os.environ.get("BR_FP", "1") == "1"
+# Code that runs on the data itself, which a data-free fingerprint cannot see.
+DATA_TIME = ("sqlglot/executor/", "sqlglot/helper.py", "sqlglot/time.py", "sqlglot/schema.py",
+             "tests/", "sqlglot/__init__.py", "sqlglot/expressions/datatypes.py")
 # Expensive test -> cheap test that runs the same code on the same queries.
 PROXIES = {
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tests/test_optimizer.py::TestOptimizer::test_tpcds",
@@ -737,6 +743,30 @@ class Selector:
             shutil.rmtree(root, ignore_errors=True)
 
 
+def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
+    """True if the patch leaves every TPC-DS query's transpilation, optimized
+    form, plan and generated executor code exactly as at the pinned commit."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not TPCDS_BASE.exists() or any(f.startswith(DATA_TIME) or not f.endswith(".py") for f in files):
+        return False
+    root = Path(tempfile.mkdtemp(prefix="brf", dir="/tmp"))
+    try:
+        build_tree(SRC, root, sel.patched, sel.deleted)
+        env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", SKIP_INTEGRATION="0",
+                   PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+        r = subprocess.run([sys.executable, str(HERE / "tpc_fp.py"), "check", str(TPCDS_BASE)], cwd=root, env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
+        return r.returncode == 0
+    except Exception as e:  # noqa: BLE001
+        log("fingerprint failed:", type(e).__name__, e)
+        return False
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
     """Mirror src into dst with symlinks, writing patched files for real."""
     touched = set(patched) | set(deleted)
@@ -809,6 +839,12 @@ def main() -> None:
                 for p, xs in plan.items():
                     if passed is not None and m.tests[p] in passed:
                         keys -= {p, *xs}
+            tp = next((k for k in keys if m.tests[k] == TPCDS_EXEC), None)
+            if FP_ON and tp is not None:
+                files = set(sel.patched) | sel.deleted
+                if fingerprint_unchanged(sel, files):
+                    keys.discard(tp)
+                    log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
         except Everything as e:
             log(f"{commit}: everything ({e})")
