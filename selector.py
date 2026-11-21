@@ -893,6 +893,8 @@ class Selector:
         self.deleted: set[str] = set()
         self.touched: dict[str, set[int]] = {}
         self.needs_import_check = False
+        self._import_result = _UNSET
+        self.import_deep = None
         self.narrowed_attrs: set[str] = set()
         self.whole_suite = False
         for fp in parse_patch(patch_text):
@@ -971,10 +973,9 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     files = set(sel.patched) | sel.deleted
     if sel.deleted or not files or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
         return chosen
-    # Code that runs at import built data the swap cannot rebuild.
-    for path, lines in sel.touched.items():
-        if lines & m.import_lines.get(path, set()):
-            return chosen
+    # Code that runs at import built data the swap cannot rebuild: such
+    # changes need the import check to show no derived state differs.
+    at_import = any(lines & m.import_lines.get(path, set()) for path, lines in sel.touched.items())
     live = [t for t in chosen if t["id"] != TPCDS_EXEC]
     rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
     secs = sum(t["seconds"] for t in live)
@@ -986,6 +987,9 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     # run serially here) plus ~1.3 s of DuckDB class setup per file.
     heavy_secs = sum(t["seconds"] for t in live if t["file"] in HEAVY_TEST_FILES)
     est = 0.03 + 0.55 * (secs - heavy_secs) + 1.6 * heavy_secs + 1.3 * len(heavy)
+    needs_check = at_import or class_data_change(sel, files)
+    if needs_check and getattr(sel, "_import_result", _UNSET) is _UNSET:
+        est += 0.75  # the live import check (~0.7 s)
     if not live or secs > FAST_MAX_SECONDS or SCORER_CPU * est >= listing - after:
         return chosen
     import resource
@@ -997,18 +1001,36 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
         fastlive.setup(str(SRC))
         c_setup = resource.getrusage(resource.RUSAGE_SELF)
         swaps = []
+        data = []
         for f in files:
             old = sel.text(f)
-            sw = fastlive.swaps_for(f, old, sel.patched[f]) if old is not None else None
+            if old is None:
+                return chosen
+            ops = fastlive.data_ops(old, sel.patched[f])
+            if ops is None:
+                log(f"{commit}: fast live: change outside function bodies and class data")
+                return chosen
+            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=bool(ops))
             if sw is None:
                 log(f"{commit}: fast live: change not confined to function bodies")
                 return chosen
             swaps += sw
+            if ops:
+                data.append((module_name(f), ops))
+        if data or at_import:
+            # Data built at import from the changed attributes (tries, copies
+            # under other names) cannot be patched in: it must not differ.
+            changes = import_changes(sel)
+            attrs = {op[1] for _, ops in data for op in ops}
+            deep = getattr(sel, "import_deep", None) if changes is not None else None
+            if deep is None or [c for c in deep if c.rsplit(".", 1)[-1] not in attrs]:
+                log(f"{commit}: fast live: class data feeds import-time state")
+                return chosen
         if not fastlive.import_tests({t["file"] for t in live}):
             log(f"{commit}: fast live: test import failed")
             return chosen
         c_imp = resource.getrusage(resource.RUSAGE_SELF)
-        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT)
+        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data)
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
         return chosen
@@ -1024,6 +1046,20 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     log(f"{commit}: fast live ran {len(live)} ({secs:.2f}s recorded), {len(live) - len(passed)} failed, "
         f"parent cpu {c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime:.2f}")
     return kept
+
+
+def class_data_change(sel: "Selector", files: set[str]) -> bool:
+    """True if some file's change is outside function bodies (cheap AST test)."""
+    import fastlive
+
+    for f in files:
+        old = sel.text(f)
+        if old is None:
+            return True
+        ops = fastlive.data_ops(old, sel.patched[f])
+        if ops is None or ops:
+            return True
+    return False
 
 
 def pack_cost(tests: list[tuple[int, float]]) -> float:
@@ -1092,6 +1128,9 @@ def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
         shutil.rmtree(root, ignore_errors=True)
 
 
+_UNSET = object()
+
+
 def import_changes(sel: "Selector") -> list[str] | None:
     """Import patched sqlglot, load every dialect and compare the SQL objects
     and dict shapes built at import with the pinned commit. Returns the
@@ -1102,6 +1141,9 @@ def import_changes(sel: "Selector") -> list[str] | None:
 
     if not IMPORT_BASE.exists():
         return None
+    if getattr(sel, "_import_result", _UNSET) is not _UNSET:
+        return sel._import_result  # already checked for this commit
+    sel._import_result = None
     root = Path(tempfile.mkdtemp(prefix="bri", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
@@ -1110,7 +1152,10 @@ def import_changes(sel: "Selector") -> list[str] | None:
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         if r.returncode != 0:
             return None
-        return [l for l in r.stdout.decode().split("\n") if l]
+        lines = [l for l in r.stdout.decode().split("\n") if l]
+        sel.import_deep = [l[5:] for l in lines if l.startswith("deep|")]
+        sel._import_result = [l for l in lines if not l.startswith("deep|")]
+        return sel._import_result
     except Exception as e:  # noqa: BLE001
         log("import check failed:", type(e).__name__, e)
         return None

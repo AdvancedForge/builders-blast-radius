@@ -34,12 +34,44 @@ def fingerprint():
 
     out = {}
 
+    import enum
+
+    def canon(v, depth=0):
+        """A stable text for data built at import: primitives, enum members,
+        classes and expressions by value; containers by content."""
+        if depth > 8:
+            return "..."
+        if v is None or isinstance(v, (bool, int, float, str, bytes)):
+            return repr(v)
+        if isinstance(v, enum.Enum):
+            return f"{type(v).__name__}.{v.name}"
+        if isinstance(v, type):
+            return f"<{v.__module__}.{v.__qualname__}>"
+        if isinstance(v, Expr):
+            return f"{type(v).__name__}:{v.sql()}"
+        if isinstance(v, dict):
+            return "{" + ",".join(sorted(f"{canon(k, depth + 1)}:{canon(x, depth + 1)}" for k, x in v.items())) + "}"
+        if isinstance(v, (set, frozenset)):
+            return "{" + ",".join(sorted(canon(x, depth + 1) for x in v)) + "}"
+        if isinstance(v, (list, tuple)):
+            items = [canon(x, depth + 1) for x in v]
+            if v and all(isinstance(x, type) for x in v):
+                items.sort()  # a tuple of classes for isinstance: often built from a set
+            return "[" + ",".join(items) + "]"
+        if callable(v):
+            return f"<fn {getattr(v, '__qualname__', type(v).__name__)}>"
+        return f"<{type(v).__name__}>"
+
     def note(where, value):
+        # Shallow entries (SQL objects, dict sizes) drive selection; "deep|"
+        # entries (full contents) only gate live data patches.
         if isinstance(value, Expr):
             out[where] = f"{type(value).__name__}:{value.sql()}"
         elif isinstance(value, dict):
             exprs = [f"{k!r}:{v.sql()}" for k, v in value.items() if isinstance(v, Expr)]
             out[where] = f"keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else "")
+        if isinstance(value, (dict, set, frozenset, list, tuple)):
+            out["deep|" + where] = canon(value)
 
     seen = set()
     for mod in mods:
