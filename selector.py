@@ -490,7 +490,7 @@ class Selector:
         it, or lazily via a class defined there, fail. Plus the tests that list
         modules from the source tree."""
         self.no_live = True
-        out = self.import_time_users(path, broken=True)
+        out = self.broken_users(path)
         for tf in ("tests/test_typing.py::", "tests/test_sqlglotc.py::"):
             out |= self.m.prefix(tf)
         if not out:
@@ -528,6 +528,78 @@ class Selector:
         out: set[int] = set()
         for x, _ in changed:
             out |= self.m.span(path, x.lineno, x.end_lineno or x.lineno)
+        return out
+
+    # sqlglot.optimizer's lazy names that are not module names
+    LAZY_ATTRS = {"RULES": "sqlglot.optimizer.optimizer", "optimize": "sqlglot.optimizer.optimizer",
+                  **{n: "sqlglot.optimizer.scope" for n in ("Scope", "build_scope", "find_all_in_scope",
+                                                            "find_in_scope", "traverse_scope", "walk_in_scope")}}
+
+    def broken_users(self, path: str) -> set[int]:
+        """Module `path` no longer imports. A test fails iff its file's
+        collection imports it (whole file), or it runs code that imports it:
+        modules loading it at import (measured at build: loaddeps.json), a
+        lazy import statement inside a function, or a dynamic import_module.
+        Static importers that only import it inside functions do not fail
+        on their own."""
+        global _LOADDEPS
+        if _LOADDEPS is None:
+            try:
+                _LOADDEPS = json.load(open(HERE / "loaddeps.json"))
+            except OSError:
+                _LOADDEPS = {}
+        mod = module_name(path)
+        if mod not in _LOADDEPS:
+            return self.import_time_users(path, broken=True)  # unmeasured: the static closure
+        mods = {mod} | set(_LOADDEPS[mod])
+        rels = {r for n in mods for r in (n.replace(".", "/") + ".py", n.replace(".", "/") + "/__init__.py")}
+        rels = {r for r in rels if r in self.m.lines or r == path}
+        out: set[int] = set()
+        for rel in rels:
+            out |= self.m.importers(rel)
+
+        def targets(node, rel):
+            if isinstance(node, ast.Import):
+                return {a.name for a in node.names}
+            base = node.module or ""
+            if node.level:
+                parts = module_name(rel).split(".")
+                keep = len(parts) - node.level + (1 if rel.endswith("__init__.py") else 0)
+                base = ".".join(parts[:keep] + ([node.module] if node.module else []))
+            out = {base} | {f"{base}.{a.name}" for a in node.names}
+            if base == "sqlglot.optimizer":
+                out |= {self.LAZY_ATTRS[a.name] for a in node.names if a.name in self.LAZY_ATTRS}
+            return out
+
+        files = [r for r in self.m.lines if r.startswith("sqlglot/")]
+        for rel in files + list(self.m.closure):
+            text = self.text(rel)
+            if text is None or not any(n.rsplit(".", 1)[-1] in text for n in mods):
+                continue
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                raise Everything(f"cannot parse {rel}")
+            test_file = not rel.startswith("sqlglot/")
+            nested = set()
+            for f in ast.walk(tree):
+                if isinstance(f, FUNC):
+                    nested |= {id(c) for c in ast.walk(f) if c is not f}
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)) and targets(node, rel) & mods:
+                    if test_file:
+                        out |= self.m.prefix(rel + "::")
+                    elif id(node) in nested:
+                        out |= self.m.span(rel, node.lineno, node.end_lineno or node.lineno)
+        for tf, cm in self.m.closure.items():
+            if cm is None:
+                raise Everything(f"unknown import closure of {tf}")
+            if rels & set(cm) or tf in rels:
+                out |= self.m.prefix(tf + "::")  # collection of the file fails
+        # Dynamic loaders (dialect lookup by name, the optimizer's lazy
+        # __getattr__, serde's __import__) cache per process, so their own
+        # lines are credited to one test; whoever goes on to use the module
+        # runs its lines or uses its classes, which `importers` already has.
         return out
 
     def import_time_users(self, path: str, broken: bool = False) -> set[int]:
@@ -1867,7 +1939,7 @@ def import_failure_users(sel: "Selector") -> set[int]:
     out: set[int] = set()
     for f in set(sel.patched) | sel.deleted:
         if f.startswith("sqlglot/") and f.endswith(".py"):
-            out |= sel.import_time_users(f, broken=True)
+            out |= sel.broken_users(f)
     for tf in ("tests/test_typing.py::", "tests/test_sqlglotc.py::"):
         out |= sel.m.prefix(tf)
     return out
