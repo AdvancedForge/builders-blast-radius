@@ -497,6 +497,39 @@ class Selector:
             raise Everything(f"no recorded importers of {path}")
         return out
 
+    def lambda_body_users(self, path: str, old_tree: ast.AST, new_tree: ast.AST) -> set[int] | None:
+        """Only lambda bodies changed (the files are equal with every outermost
+        lambda's body blanked). A body runs only when the lambda is called,
+        never when it is created at import, and every copy of it (dicts merged
+        into TRANSFORMS) is the same function object: the tests that ran the
+        lambda's lines are all it can affect. None if anything else changed."""
+        import copy
+
+        def outer_lambdas(tree):
+            out, stack = [], [tree]
+            while stack:
+                n = stack.pop(0)
+                for c in ast.iter_child_nodes(n):
+                    (out if isinstance(c, ast.Lambda) else stack).append(c)
+            return out
+
+        a, b = outer_lambdas(old_tree), outer_lambdas(new_tree)
+        if not a or len(a) != len(b):
+            return None
+        changed = [(x, y) for x, y in zip(a, b) if ast.dump(x.body) != ast.dump(y.body)]
+        if not changed:
+            return None
+        sa, sb = copy.deepcopy(old_tree), copy.deepcopy(new_tree)
+        for t in (sa, sb):
+            for lam in outer_lambdas(t):
+                lam.body = ast.Constant(None)
+        if ast.dump(sa) != ast.dump(sb):
+            return None
+        out: set[int] = set()
+        for x, _ in changed:
+            out |= self.m.span(path, x.lineno, x.end_lineno or x.lineno)
+        return out
+
     def import_time_users(self, path: str, broken: bool = False) -> set[int]:
         """Everything that imports `path` or a module importing it, plus the
         users of every class those modules define."""
@@ -988,6 +1021,9 @@ class Selector:
         typing_users = self.typing_metadata_users(path, old_text, new_text)
         if typing_users is not None:
             return typing_users | extra
+        lam = self.lambda_body_users(path, old_tree, new_tree)
+        if lam is not None:
+            return lam | extra
         old_lines = old_text.split("\n")
         new_lines = new_text.split("\n")
         # The whole-module comparison (docstrings, == None) costs two parses
