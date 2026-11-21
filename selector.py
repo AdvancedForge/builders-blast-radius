@@ -423,6 +423,42 @@ class Selector:
                 pass
         return out
 
+    def typing_metadata_users(self, path: str, old_text: str, new_text: str) -> set[int] | None:
+        """A typing/<dialect>.py edit that only changes EXPRESSION_METADATA:
+        the tests that looked up a changed expression type. sqlglot reads that
+        dict only through TypeAnnotator's .get(expr.__class__) (copies aside),
+        and the map records each test's lookups. None if not applicable."""
+        if not path.startswith("sqlglot/typing/") or "EXPRESSION_METADATA" not in self.m.key_attrs:
+            return None
+        import fastlive
+
+        ops = fastlive.data_ops(old_text, new_text)
+        if not ops or any(op[2] != "dict2" or op[1] != "EXPRESSION_METADATA" or op[0] for op in ops):
+            return None
+        try:
+            fastlive.setup(str(SRC))
+            if fastlive.swaps_for(path, old_text, new_text, allow_bodies=True):
+                return None  # function bodies changed too
+            mod = sys.modules[module_name(path)]
+            ns = dict(vars(mod))
+            out: set[int] = set()
+            for _, _, _, old_src, new_src in ops:
+                a, b = eval(old_src, ns), eval(new_src, ns)
+                for k in set(a) | set(b):
+                    if k in a and k in b and fastlive._safe_eq(a[k], b[k]):
+                        continue
+                    if not isinstance(k, type):
+                        return None
+                    idx = self.m.keys.get(f"EXPRESSION_METADATA|t:{k.__qualname__}")
+                    if idx is not None:
+                        out |= self.m.s(idx)
+            self.needs_import_check = True  # anything derived from it at import
+            self.narrowed_attrs.add("EXPRESSION_METADATA")
+            return out
+        except Exception as e:  # noqa: BLE001
+            log(f"typing narrowing failed: {type(e).__name__}: {e}")
+            return None
+
     @staticmethod
     def dict_spans(stmt, ln) -> bool:
         """True if line `ln` of the assignment lies inside a dict literal (the
@@ -756,6 +792,9 @@ class Selector:
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
         old_tree = self.tree(fp.old)
+        typing_users = self.typing_metadata_users(path, old_text, new_text)
+        if typing_users is not None:
+            return typing_users
         old_lines = old_text.split("\n")
         new_lines = new_text.split("\n")
         # The whole-module comparison (docstrings, == None) costs two parses
@@ -1098,7 +1137,8 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     c1 = resource.getrusage(resource.RUSAGE_SELF)
     k1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     _u = lambda a, b: b.ru_utime + b.ru_stime - a.ru_utime - a.ru_stime
-    log(f"{commit}: est {est:.2f} listing {listing - after:.2f}")
+    log(f"{commit}: est {est:.2f} listing {listing - after:.2f} masks "
+        + ",".join(f"{k.split('::')[-1]}:{bin(v).count('1')}" for k, v in masks.items()))
     log(f"{commit}: fast cpu setup {_u(c0, c_setup):.2f} imports {_u(c_setup, c_imp):.2f} "
         f"swap+fork {_u(c_imp, c1):.2f} child {_u(k0, k1):.2f}")
     if passed is None:
@@ -1453,6 +1493,23 @@ def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
 
 
 _UNSET = object()
+_REVDEPS = None
+
+
+def deep_modules(sel: "Selector") -> list[str]:
+    """Patched modules plus every module that imports them (transitively):
+    copies of their data and state derived from it live there."""
+    global _REVDEPS
+    if _REVDEPS is None:
+        try:
+            _REVDEPS = json.load(open(HERE / "revdeps.json"))
+        except OSError:
+            _REVDEPS = {}
+    mods = {module_name(f) for f in set(sel.patched) | sel.deleted if f.endswith(".py")}
+    out = set(mods)
+    for mname in mods:
+        out |= set(_REVDEPS.get(mname, ()))
+    return sorted(out)
 
 
 def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
@@ -1474,7 +1531,7 @@ def import_changes(sel: "Selector", deep: bool = False) -> list[str] | None:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp",
                    BR_IMPORT_DEEP="1",
-                   BR_DEEP_MODULES=",".join(module_name(f) for f in set(sel.patched) | sel.deleted if f.endswith(".py")))
+                   BR_DEEP_MODULES=",".join(deep_modules(sel)))
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
                            env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
         if r.returncode != 0:

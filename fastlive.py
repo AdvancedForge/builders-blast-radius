@@ -107,6 +107,10 @@ def import_tests(files: set[str]) -> bool:
 
 def _live_index() -> dict:
     global _LIVE
+    if not _READY:
+        # Built before sqlglot is loaded the index would be empty, and cached
+        # empty every later swap would patch nothing (a false pass).
+        raise RuntimeError("fastlive.setup() must run before swaps are computed")
     if _LIVE is None:
         idx: dict = {}
         prefix = os.path.join(_SRC, "sqlglot") + os.sep
@@ -194,6 +198,14 @@ def data_ops(old_text: str, new_text: str):
                 if not body(x.body, y.body, (path or ()) + (x.name,)):
                     return False
                 continue
+            if isinstance(x, (ast.Assign, ast.AnnAssign)) and _dict_like(x) and _dict_like(y) and _one_name(x, y):
+                attr = (x.targets[0] if isinstance(x, ast.Assign) else x.target).id
+                if path and isinstance(x.value, ast.Dict) and isinstance(y.value, ast.Dict) \
+                        and dict_ops(x.value, y.value, path, attr):
+                    continue
+                ops.append((path or (), attr, "dict2", ast.get_source_segment(old_text, x.value),
+                            ast.get_source_segment(seg_new, y.value)))
+                continue
             if path and isinstance(x, (ast.Assign, ast.AnnAssign)):
                 tx = x.targets if isinstance(x, ast.Assign) else [x.target]
                 ty = y.targets if isinstance(y, ast.Assign) else [y.target]
@@ -227,7 +239,7 @@ def data_ops(old_text: str, new_text: str):
         if ex is None or ey is None:
             return False
         if {k for k in ex if isinstance(k, tuple)} != {k for k in ey if isinstance(k, tuple)}:
-            return False  # a ** splat changed
+            return False  # a ** splat changed: the caller diffs whole literals instead
         keys = []
         for k in ex.keys() | ey.keys():
             if isinstance(k, tuple):
@@ -248,6 +260,84 @@ def data_ops(old_text: str, new_text: str):
     if not body(a.body, b.body, None):
         return None
     return ops
+
+
+def _dict_like(stmt) -> bool:
+    import ast
+    v = stmt.value
+    return isinstance(v, (ast.Dict, ast.DictComp)) or (
+        isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "dict")
+
+
+def _one_name(x, y) -> bool:
+    import ast
+    tx = x.targets if isinstance(x, ast.Assign) else [x.target]
+    ty = y.targets if isinstance(y, ast.Assign) else [y.target]
+    return len(tx) == 1 and len(ty) == 1 and isinstance(tx[0], ast.Name) and isinstance(ty[0], ast.Name) \
+        and tx[0].id == ty[0].id
+
+
+def _safe_eq(a, b) -> bool:
+    try:
+        return bool(a == b) and type(a) is type(b)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _all_dicts():
+    """Every dict held as a module global or class attribute in sqlglot."""
+    out = []
+    seen = set()
+    for name, mod in list(sys.modules.items()):
+        if not name.startswith("sqlglot") or mod is None:
+            continue
+        stack = [mod]
+        while stack:
+            o = stack.pop()
+            if id(o) in seen:
+                continue
+            seen.add(id(o))
+            for v in list(vars(o).values()):
+                if type(v) is dict:
+                    out.append(v)
+                elif inspect.isclass(v) and v.__module__ == name:
+                    stack.append(v)
+    return out
+
+
+def _apply_dict2(target, attr, old_src, new_src):
+    """Apply the edit between two dict literals: evaluate both in the owner's
+    namespace, and for every key whose value differs, update the live dict and
+    every other dict that still holds the old live value under that key (or,
+    for a new key, every dict that copied all of the live dict's keys)."""
+    module = sys.modules[target.__module__] if inspect.isclass(target) else target
+    ns = dict(vars(module))
+    if inspect.isclass(target):
+        ns.update(vars(target))
+    old_val, new_val = eval(old_src, ns), eval(new_src, ns)
+    live = target.__dict__.get(attr) if inspect.isclass(target) else vars(target).get(attr)
+    if type(live) is not dict:
+        raise RuntimeError(f"{attr} is not a plain dict")
+    keys = [k for k in set(old_val) | set(new_val)
+            if k not in old_val or k not in new_val or not _safe_eq(old_val[k], new_val[k])]
+    dicts = _all_dicts()
+    before = set(live)
+    for k in keys:
+        old_live = live.get(k, _MISSING)
+        new = new_val.get(k, _MISSING)
+        targets = [live]
+        for d in dicts:
+            if d is live:
+                continue
+            if old_live is not _MISSING and d.get(k, _MISSING) is old_live:
+                targets.append(d)
+            elif old_live is _MISSING and k not in d and before and before <= set(d):
+                targets.append(d)
+        for t in targets:
+            if new is _MISSING:
+                t.pop(k, None)
+            else:
+                t[k] = new
 
 
 def _apply_data(module, ops):
@@ -320,6 +410,9 @@ def _apply_ops(module, ops):
         cls = module
         for name in path:
             cls = getattr(cls, name)
+        if op == "dict2":
+            _apply_dict2(cls, attr, ksrc, vsrc)
+            continue
         ns = dict(vars(module))
         ns.update({k: v for k, v in vars(cls).items()})
         if op in ("addmethod", "delmethod"):
@@ -411,8 +504,8 @@ def swaps_for(rel: str, old_text: str, new_text: str, allow_bodies: bool = False
             return None
         if _own(oc) != _own(nc):
             if not (oc.co_flags & inspect.CO_NEWLOCALS):
-                if allow_bodies and a[i][1] >= 0:
-                    continue  # a class body (not the module): data_ops applies it
+                if allow_bodies:
+                    continue  # a class or module body: data_ops applies its data changes
                 return None  # a module or class body: data built at import
             changed.add(i)
     pair_of = dict(pairs)
