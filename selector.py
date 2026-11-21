@@ -471,11 +471,14 @@ class Selector:
                             users |= self.m.s(idx)
                 if users is not None:
                     out &= users
-            self.needs_import_check = True  # anything derived from it at import
+            # No import check: EXPRESSION_METADATA is only copied at import
+            # (dialects' .copy()/** merges), never derived from, and a literal
+            # that cannot evaluate (a broken import) raised above and fell back.
             self.narrowed_attrs.add("EXPRESSION_METADATA")
             return out
         except Exception as e:  # noqa: BLE001
             log(f"typing narrowing failed: {type(e).__name__}: {e}")
+            self.needs_import_check = True  # the module may not even import
             return None
 
     @staticmethod
@@ -642,6 +645,10 @@ class Selector:
             return out
         if names_hint and depth > 2:
             return set()
+        if not names_hint and path.startswith("sqlglot/"):
+            # Module or class level code runs at import: if the patched module
+            # fails to import, every importer fails; the import check finds out.
+            self.needs_import_check = True
         if classes:
             quals: list[str] = []
             for n in ch:
@@ -857,6 +864,8 @@ class Selector:
             return set()  # blank or comment
         if is_bare_string(nstmts[-1]):
             return set()  # inside a docstring: no effect at runtime
+        if path.startswith("sqlglot/") and not any(isinstance(x, FUNC + (ast.Lambda,)) for x in nch):
+            self.needs_import_check = True  # new module/class-level code runs at import
         if path.startswith("tests/"):
             # A brand-new test_* method in a test class: not in tests.json, and
             # a new name cannot change what the existing tests run.
