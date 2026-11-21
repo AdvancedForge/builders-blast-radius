@@ -1250,7 +1250,7 @@ class Selector:
             plan.setdefault(p, []).append(x)
         return plan
 
-    def run_live(self, node_ids: list[str]) -> set[str] | None:
+    def run_live(self, node_ids: list[str], timeout: float = LIVE_TIMEOUT) -> set[str] | None:
         """Run tests on the patched tree; return the ids that passed, or None."""
         import shutil
         import subprocess
@@ -1265,7 +1265,7 @@ class Selector:
             cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "live_plugin",
                    "-o", "addopts=", *node_ids]
             r = subprocess.run(cmd, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               timeout=LIVE_TIMEOUT)
+                               timeout=timeout)
             if not out.exists():
                 log("live run wrote nothing:", r.stderr[-400:].decode(errors="replace"))
                 return None
@@ -2002,48 +2002,137 @@ def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str])
 # ------------------------------------------------------------------------ output
 
 
-MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+DIAG_OUT: list = []
+DIAG = {"waste": 0.0, "big": 0, "unmeasured": 0}
 
 
-def diag_mark(workers: list[list[int]], chosen: list[dict], all_tests: list[dict]) -> list[list[int]]:
-    """DIAGNOSTIC build: same selection, plus marker tests in the busiest
-    worker whose durations sum to a code, so the board's exact simulated
-    total counts expensive commits by shape. Adding tests cannot miss.
-    1 ms: lists test_max_nodes; 31 ms: lists test_execute_tpcds (and not
-    max_nodes); 961 ms: neither, but costs >= 8 s."""
+def _cost(ws, ms):
+    ws = [w for w in ws if w]
+    return (max(sum(ms[n] for n in w) for w in ws) + 2000 * len(ws)) if ws else 0
+
+
+DIAG_JOBS: list = []
+
+
+def diag_measure(sel, commit, chosen, workers, every) -> None:
+    """DIAGNOSTIC: queue this commit's selection to be run for real later."""
     if not workers:
-        return workers
-    ms = {t["number"]: round(t["seconds"] * 1000) for t in all_tests}
-    ids = {t["id"] for t in chosen}
-    loads = [sum(ms[n] for n in w) for w in workers]
-    cost = max(loads) + 2000 * len(workers)
-    if MAX_NODES in ids:
-        code = 1
-    elif TPCDS_EXEC in ids:
-        code = 31
-    elif cost >= 8000:
-        code = 961
-    else:
-        return workers
-    used = {n for w in workers for n in w}
-    # Exact subset sum over unused tests (small durations first).
-    cand = sorted(((ms[t["number"]], t["number"]) for t in all_tests
-                   if t["number"] not in used and 0 < ms[t["number"]] <= code), key=lambda x: (-x[0], x[1]))
-    reach = {0: []}
-    for d, n in cand:
-        for tot, picked in list(reach.items()):
-            if tot + d <= code and tot + d not in reach:
-                reach[tot + d] = picked + [n]
-        if code in reach:
+        return
+    if len(chosen) >= 1600:
+        DIAG["unmeasured"] += 1
+        return
+    DIAG_JOBS.append((sum(t["seconds"] for t in chosen), commit, (dict(sel.patched), set(sel.deleted)), chosen, workers))
+
+
+def diag_run_all(every) -> None:
+    """Run every queued selection for real on its patched tree (pytest, two
+    at a time, cheapest first) until the batch deadline nears. 0 misses means
+    every failing test is in the selection, so failing tests give the ideal
+    cost and our waste."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    ms = {t["number"]: round(t["seconds"] * 1000) for t in every}
+    jobs = sorted(DIAG_JOBS, key=lambda j: j[0])
+    running = []
+
+    def finish(job, root, proc, killed):
+        _, commit, sel, chosen, workers = job
+        out = root / ".live.json"
+        ok = not killed and out.exists()
+        if ok:
+            res = json.loads(out.read_text())
+            if any(f == "<collect>" or "::" not in f for f in res["failed"]):
+                failing = chosen
+            else:
+                failing = [t for t in chosen if t["id"] in res["failed"] or t["id"] not in res["seen"]]
+            ideal = _cost(pack([(t["number"], t["seconds"]) for t in failing]), ms)
+            waste = max(0, _cost(workers, ms) - ideal) / 1000
+            DIAG["waste"] += waste
+            DIAG["big"] += waste >= 3
+            log(f"diag: {commit} waste {waste:.2f} ({len(failing)} failing of {len(chosen)})")
+        else:
+            DIAG["unmeasured"] += 1
+            log(f"diag: {commit} unmeasured ({'killed' if killed else 'no result'})")
+        shutil.rmtree(root, ignore_errors=True)
+
+    while jobs or running:
+        now = _time.monotonic() - STARTED
+        while jobs and len(running) < 2 and now < 105:
+            job = jobs.pop(0)
+            root = Path(tempfile.mkdtemp(prefix="brd", dir="/tmp"))
+            patched, deleted = job[2]
+            build_tree(SRC, root, patched, deleted)
+            env = dict(os.environ, PYTHONPATH=f"{root}{os.pathsep}{HERE}", SKIP_INTEGRATION="0",
+                       BR_LIVE_OUT=str(root / ".live.json"), PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
+            cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "live_plugin",
+                   "-o", "addopts=", *[t["id"] for t in job[3]]]
+            proc = subprocess.Popen(cmd, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            running.append((job, root, proc))
+        if not jobs or now >= 105:
+            for job in jobs:
+                DIAG["unmeasured"] += 1
+                log(f"diag: {job[1]} unmeasured (no time)")
+            jobs = []
+        still = []
+        for job, root, proc in running:
+            if proc.poll() is not None:
+                finish(job, root, proc, False)
+            elif _time.monotonic() - STARTED > 140:
+                proc.kill(); proc.wait()
+                finish(job, root, proc, True)
+            else:
+                still.append((job, root, proc))
+        running = still
+        _time.sleep(0.05)
+
+
+def diag_finish(every) -> None:
+    """Encode V = round(10*waste) [11 bits] + big<<11 [5 bits] + unmeasured<<16
+    [5 bits] milliseconds as marker tests added to busiest workers, then
+    print every line. Simulated total = normal total + V ms."""
+    diag_run_all(every)
+    ms = {t["number"]: round(t["seconds"] * 1000) for t in every}
+    v = min(2047, round(10 * DIAG["waste"])) + (min(31, DIAG["big"]) << 11) + (min(31, DIAG["unmeasured"]) << 16)
+    log(f"diag: V={v} waste={DIAG['waste']:.2f} big={DIAG['big']} unmeasured={DIAG['unmeasured']}")
+    left = v
+    hosts = []
+    for i, (c, ws) in enumerate(DIAG_OUT):
+        ws = [list(w) for w in ws]
+        DIAG_OUT[i] = (c, ws)
+        if not ws:
+            continue
+        used = {n for w in ws for n in w}
+        if len(used) >= 1600:
+            continue
+        loads = [sum(ms[n] for n in w) for w in ws]
+        b = loads.index(max(loads))
+        free = sorted((n for n in ms if n not in used and ms[n] > 0), key=lambda n: -ms[n])
+        for n in free:
+            if left <= 3000:
+                break
+            if ms[n] <= left - 2000:
+                ws[b].append(n); left -= ms[n]; used.add(n)
+        hosts.append((ws, b, used))
+    # Exact remainder on the first host whose unused tests can hit it.
+    for ws, b, used in hosts:
+        if left == 0:
             break
-    if code not in reach:
-        log(f"diag: no exact marker for {code}")
-        return workers
-    i = loads.index(max(loads))
-    workers = [list(w) for w in workers]
-    workers[i] += reach[code]
-    log(f"diag: code {code}")
-    return workers
+        reach = {0: []}
+        for n in sorted((n for n in ms if n not in used and 0 < ms[n] <= left), key=lambda n: ms[n]):
+            for tot, pk in list(reach.items()):
+                t2 = tot + ms[n]
+                if t2 <= left and t2 not in reach:
+                    reach[t2] = pk + [n]
+            if left in reach:
+                break
+        if left in reach:
+            ws[b] += reach[left]; left = 0
+    if left:
+        log(f"diag: could not place {left} ms")
+    for c, ws in DIAG_OUT:
+        print(json.dumps({"commit": c, "workers": ws}), flush=True)
 
 
 def pack(tests: list[tuple[int, float]]) -> list[list[int]]:
@@ -2186,10 +2275,11 @@ def main() -> None:
             log(f"{commit}: error {type(e).__name__}: {e}; selecting everything")
             chosen = every
         workers = pack([(t["number"], t["seconds"]) for t in chosen])
-        workers = diag_mark(workers, chosen, every)
-        print(json.dumps({"commit": commit, "workers": workers}), flush=True)
+        diag_measure(sel, commit, chosen, workers, every)
+        DIAG_OUT.append((commit, workers))
         log(f"{commit}: commit cpu {_cpu() - _c0:.2f}")
         log(f"{commit}: {len(chosen)} tests, {len(workers)} workers")
+    diag_finish(every)
 
 
 if __name__ == "__main__":
