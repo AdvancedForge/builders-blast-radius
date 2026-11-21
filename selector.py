@@ -70,6 +70,7 @@ class Map:
         self.reads: dict[str, int] = m["reads"]
         self.classes: dict[str, int] = m["classes"]
         self.closure: dict[str, list[str] | None] = m["closure"]
+        self.import_lines: dict[str, set[int]] = {f: set(v) for f, v in m["import"].items()}
         self.all = set(range(len(self.tests)))
         self._by_prefix: dict[str, set[int]] = {}
 
@@ -269,6 +270,7 @@ class Selector:
         self._trees: dict[str, ast.AST] = {}
         self._exp_users: dict[str, set[int] | None] = {}
         self._refs: dict[str, set[int]] = {}
+        self._reads_cache: dict[str, set[int] | None] = {}
         self._lines: dict[str, list[str]] = {}
 
     def text(self, rel: str) -> str | None:
@@ -298,6 +300,47 @@ class Selector:
 
     def class_users(self, path: str, quals: list[str]) -> set[int] | None:
         return self.m.users(f"{module_name(path)}:{'.'.join(quals)}")
+
+    def runtime_reads(self, name: str) -> set[int] | None:
+        """Tests that ran a line reading attribute/name `name`, or None if any
+        read happens outside a function (class creation, module import), where
+        coverage cannot say who depends on it. Class-body assignments of the
+        same name (definitions and overrides) are not reads."""
+        if name in self._reads_cache:
+            return self._reads_cache[name]
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        out: set[int] | None = set()
+        for rel in self.m.lines:
+            if not rel.startswith("sqlglot/"):
+                continue
+            text = self.text(rel)
+            if text is None or name not in text:
+                continue
+            tree = None
+            for i, l in enumerate(self.lines_of(rel), 1):
+                if name not in l or not pat.search(l) or l.lstrip().startswith("#"):
+                    continue
+                tree = tree or self.tree(rel)
+                ch = chain(tree, i)
+                stmts = [n for n in ch if isinstance(n, ast.stmt)]
+                in_code = any(isinstance(n, FUNC + (ast.Lambda,)) for n in ch)
+                if not in_code:
+                    st = stmts[-1] if stmts else None
+                    is_def = (isinstance(st, (ast.Assign, ast.AnnAssign)) and name in self.assigned(st)
+                              and st.lineno == i and re.match(r"\s*" + re.escape(name) + r"\b", l))
+                    if is_def:
+                        continue
+                    out = None
+                    break
+                st = stmts[-1]
+                if i in self.m.import_lines.get(rel, ()):
+                    out = None  # read while modules load (e.g. a metaclass): users unknown
+                    break
+                out |= self.m.span(rel, start(st), st.end_lineno or st.lineno) | self.m.line(rel, i)
+            if out is None:
+                break
+        self._reads_cache[name] = out
+        return out
 
     def lines_of(self, rel: str) -> list[str]:
         if rel not in self._lines:
@@ -389,6 +432,11 @@ class Selector:
                 cls = classes[-1]
                 names = {cls.name} | self.assigned(stmt) | extra_names
                 return m.span(path, cls.lineno, cls.end_lineno) | self.refs(names, depth)
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt in classes[-1].body:
+                names = self.assigned(stmt)
+                reads = [self.runtime_reads(n) for n in names] if names else [None]
+                if all(r is not None for r in reads):
+                    return users & set().union(*reads)
             keys = self.dict_keys(path, ch, ln) | extra_names
             if keys:
                 narrowed: set[int] = set()
@@ -517,6 +565,11 @@ class Selector:
                     keys = names
                     if keys and all(self.exp_users(x) is not None for x in keys):
                         users = users & set().union(*(self.exp_users(x) for x in keys))
+                    elif isinstance(member, (ast.Assign, ast.AnnAssign)) and not any(
+                            isinstance(x, ast.Dict) for x in nch[ci + 2:]):
+                        reads = [self.runtime_reads(x) for x in self.assigned(member)] or [None]
+                        if all(r is not None for r in reads):
+                            users = users & set().union(*reads)
                     out |= users
         if ci is None and not any(isinstance(x, FUNC) for x in nch):
             stmt = nstmts[-1]
