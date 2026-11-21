@@ -35,6 +35,13 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", HERE / "maps" / "map.json.gz"))
 LIVE = os.environ.get("BR_LIVE", "0") == "1"  # live proxies cost more CPU than they save
+# Small selections are run live instead of listed: ~0.4 s of CPU against the
+# 2 s a worker costs, and only tests that really fail are listed.
+SMALL = os.environ.get("BR_SMALL", "1") == "1"
+# Importing these pulls in DuckDB and pandas and sets up process pools: a live
+# run costs 1.3-3 s of CPU, no better than listing.
+HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
+SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "1.5"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
@@ -922,6 +929,18 @@ def main() -> None:
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
+            code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
+            heavy = any(t["file"] in HEAVY_TEST_FILES for t in chosen)
+            if SMALL and chosen and code_change and not heavy and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
+                import resource
+                c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                passed = sel.run_live([t["id"] for t in chosen])
+                c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                if passed is not None:
+                    log(f"{commit}: ran {len(chosen)} live, {len(chosen) - len(passed)} failed, "
+                        f"cpu {c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime:.2f} "
+                        f"files {sorted({t['file'] for t in chosen})[:4]}")
+                    chosen = [t for t in chosen if t["id"] not in passed]
         except Everything as e:
             log(f"{commit}: everything ({e})")
             chosen = every

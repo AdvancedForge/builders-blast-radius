@@ -8,6 +8,10 @@ COPY tools/fetch_sqlglot.py /tmp/fetch_sqlglot.py
 RUN python /tmp/fetch_sqlglot.py ${SQLGLOT_COMMIT} \
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests; chmod -R a+rX /opt/sqlglot
 
+# Test dependencies as labeled, for small live runs.
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+
 COPY maps/map.json.gz /app/maps/map.json.gz
 COPY selector.py live_plugin.py tpc_fp.py import_fp.py /app/
 # Fingerprint of what the TPC-DS executor test computes at the pinned commit.
