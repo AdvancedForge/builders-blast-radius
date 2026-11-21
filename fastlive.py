@@ -355,8 +355,34 @@ def _to_unittest(node_id: str) -> str:
     return f"{f[:-3].replace('/', '.')}.{cls}.{meth}"
 
 
+def _restrict_entries(masks: dict[str, int]) -> None:
+    """In the child: make TestOptimizer.check_file see only the fixture
+    entries in its test's mask (entries numbered from 1 per file)."""
+    import tests.test_optimizer as TO
+
+    cur = [None]
+    orig_cf = TO.TestOptimizer.check_file
+    orig_pairs = TO.load_sql_fixture_pairs
+
+    def check_file(self, *a, **kw):
+        _, cls, meth = self.id().rsplit(".", 2)
+        cur[0] = masks.get(f"tests/test_optimizer.py::{cls}::{meth}")
+        try:
+            return orig_cf(self, *a, **kw)
+        finally:
+            cur[0] = None
+
+    def pairs(filename):
+        for i, item in enumerate(orig_pairs(filename), start=1):
+            if cur[0] is None or cur[0] >> i & 1:
+                yield item
+
+    TO.TestOptimizer.check_file = check_file
+    TO.load_sql_fixture_pairs = pairs
+
+
 def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = None,
-        defer: set[str] | None = None) -> set[str] | None:
+        defer: set[str] | None = None, masks: dict[str, int] | None = None) -> set[str] | None:
     """Fork, apply swaps, run the tests; return the node ids that passed."""
     names = {_to_unittest(n): n for n in node_ids}
     r, w = os.pipe()
@@ -375,6 +401,8 @@ def run(node_ids: list[str], swaps: list, timeout: float, data: list | None = No
                     f.__code__ = nc
             for modname, ops in (data or []):
                 _apply_data(sys.modules[modname], ops)
+            if masks:
+                _restrict_entries(masks)
             loader = unittest.TestLoader()
             first, second = unittest.TestSuite(), unittest.TestSuite()
             for name in names:

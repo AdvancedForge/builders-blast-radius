@@ -995,7 +995,14 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     at_import = any(lines & m.import_lines.get(path, set()) for path, lines in sel.touched.items())
     live = [t for t in chosen if t["id"] != TPCDS_EXEC]
     rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
-    if not FAST_HEAVY and any(t["file"] in HEAVY_TEST_FILES for t in live):
+    # check_file tests run only the fixture entries that reach the change.
+    masks = {}
+    for t in live:
+        if ENTRY_LIVE and t["file"] == "tests/test_optimizer.py":
+            mk = entry_mask(sel, t["id"])
+            if mk is not None:
+                masks[t["id"]] = mk
+    if not FAST_HEAVY and any(t["file"] in HEAVY_TEST_FILES and t["id"] not in masks for t in live):
         return chosen
     if not FAST_DATA and (at_import or class_data_change(sel, files)):
         return chosen
@@ -1008,7 +1015,11 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     # heavy module costs ~0.25 s once per batch.
     by = {}
     for t in live:
-        by[t["file"]] = by.get(t["file"], 0.0) + t["seconds"]
+        sec = t["seconds"]
+        if t["id"] in masks:
+            total = max((v for per in _ENTRIES[t["id"]]["lines"].values() for v in per.values()), default=1)
+            sec *= max(bin(masks[t["id"]]).count("1"), 0) / max(total.bit_length() - 1, 1)
+        by[t["file"]] = by.get(t["file"], 0.0) + sec
     opt = by.pop("tests/test_optimizer.py", 0.0)
     exe = by.pop("tests/test_executor.py", 0.0)
     est = 0.03 + 0.55 * sum(by.values()) + 1.4 * opt + 0.8 * exe + (1.0 if exe else 0.0)
@@ -1059,7 +1070,8 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
             log(f"{commit}: fast live: test import failed")
             return chosen
         c_imp = resource.getrusage(resource.RUSAGE_SELF)
-        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data, defer=HEAVY_TEST_FILES)
+        passed = fastlive.run([t["id"] for t in live], swaps, LIVE_TIMEOUT, data, defer=HEAVY_TEST_FILES,
+                              masks=masks)
     except Exception as e:  # noqa: BLE001
         log(f"{commit}: fast live failed: {type(e).__name__}: {e}")
         return chosen
@@ -1076,6 +1088,50 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     log(f"{commit}: fast live ran {len(live)} ({secs:.2f}s recorded), {len(live) - len(passed)} failed, "
         f"parent cpu {c1.ru_utime + c1.ru_stime - c0.ru_utime - c0.ru_stime:.2f}")
     return kept
+
+
+_ENTRIES = None
+# Off by default: neutral on the labelled set and sample (the big savings
+# are blocked by setUp-level code, executor tests or data edits).
+ENTRY_LIVE = os.environ.get("BR_ENTRY_LIVE", "0") == "1"
+ENTRIES = Path(os.environ.get("BR_ENTRIES", HERE / "maps" / "entries.json.gz"))
+
+
+def entry_mask(sel: "Selector", test: str) -> int | None:
+    """Fixture entries of a check_file test that run a changed function, as a
+    bitmask (entries numbered from 1), or None when every entry must run: a
+    change outside a function, outside sqlglot, or in code the test runs
+    outside its entry loop."""
+    global _ENTRIES
+    if _ENTRIES is None:
+        try:
+            with gzip.open(ENTRIES, "rt") as fh:
+                _ENTRIES = json.load(fh)
+        except OSError:
+            _ENTRIES = {}
+    e = _ENTRIES.get(test)
+    if e is None or not sel.touched:
+        return None
+    mask = 0
+    for path, lines in sel.touched.items():
+        if not path.startswith("sqlglot/"):
+            return None
+        tree = sel.tree(path)
+        per = e["lines"].get(path, {})
+        outside = set(e["outside"].get(path, ()))
+        for ln in lines:
+            ch = chain(tree, ln)
+            funcs = [n for n in ch if isinstance(n, FUNC)]
+            if not funcs:
+                if [n for n in ch if isinstance(n, ast.stmt)]:
+                    return None
+                continue
+            f = funcs[-1]
+            for x in range(start(f), (f.end_lineno or f.lineno) + 1):
+                if x in outside:
+                    return None
+                mask |= per.get(str(x), 0)
+    return mask
 
 
 def class_data_change(sel: "Selector", files: set[str]) -> bool:
