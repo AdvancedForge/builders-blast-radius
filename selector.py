@@ -45,7 +45,16 @@ SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
 MAX_WORKERS = 8
 WORKER_COST = 2.0
 
-LIVE_TIMEOUT = 60
+LIVE_TIMEOUT = 25
+# The batch must finish in 3 minutes (4.5 in the final); live work stops
+# after this much wall time so a hanging patch cannot get the run rejected.
+import time as _time
+STARTED = _time.monotonic()
+LIVE_BUDGET = float(os.environ.get("BR_LIVE_BUDGET", "90"))
+
+
+def live_allowed() -> bool:
+    return _time.monotonic() - STARTED < LIVE_BUDGET
 IMPORT_BASE = Path(os.environ.get("BR_IMPORT_BASE", HERE / "import_fp.json"))
 TPCDS_EXEC = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_BASE = Path(os.environ.get("BR_TPCDS_BASE", HERE / "tpcds_fp.json"))
@@ -909,7 +918,7 @@ def main() -> None:
             try:
                 keys = sel.commit(text)
             except Everything as e:
-                if not str(e).startswith("import-time") or not import_unchanged(sel):
+                if not str(e).startswith("import-time") or not live_allowed() or not import_unchanged(sel):
                     raise
                 log(f"{commit}: import-time state unchanged, selecting normally")
                 sel.import_ok = True
@@ -923,7 +932,7 @@ def main() -> None:
                     if passed is not None and m.tests[p] in passed:
                         keys -= {p, *xs}
             tp = next((k for k in keys if m.tests[k] == TPCDS_EXEC), None)
-            if FP_ON and tp is not None:
+            if FP_ON and tp is not None and live_allowed():
                 files = set(sel.patched) | sel.deleted
                 if fingerprint_unchanged(sel, files):
                     keys.discard(tp)
@@ -931,7 +940,7 @@ def main() -> None:
             chosen = [by_id[m.tests[k]] for k in keys if m.tests[k] in by_id]
             code_change = any(f.endswith(".py") for f in set(sel.patched) | sel.deleted)
             heavy = any(t["file"] in HEAVY_TEST_FILES for t in chosen)
-            if SMALL and chosen and code_change and not heavy and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
+            if SMALL and chosen and code_change and not heavy and live_allowed() and sum(t["seconds"] for t in chosen) <= SMALL_MAX_SECONDS:
                 import resource
                 c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
                 passed = sel.run_live([t["id"] for t in chosen])
