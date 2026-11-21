@@ -47,6 +47,11 @@ HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
 # imported once; each commit forks, swaps the changed function bodies and runs
 # its candidates, costing about the tests' own time.
 FAST = os.environ.get("BR_FAST", "1") == "1"
+# Practice board: these cost about as much CPU as they saved there, since
+# practice commits mostly break what they touch (run 23bb751: -8.9 s
+# simulated, +11.5 s CPU). Off by default; light function-body runs stay.
+FAST_DATA = os.environ.get("BR_FAST_DATA", "0") == "1"
+FAST_HEAVY = os.environ.get("BR_FAST_HEAVY", "0") == "1"
 SCORER_CPU = float(os.environ.get("BR_SCORER_CPU", "1.0"))  # board CPU ~= local (practice: 1.5 s)
 FAST_MAX_SECONDS = float(os.environ.get("BR_FAST_MAX", "25"))
 SMALL_MAX_SECONDS = float(os.environ.get("BR_SMALL_MAX", "3.0"))
@@ -866,6 +871,18 @@ class Selector:
     def data_file(self, fp: FilePatch) -> set[int]:
         m = self.m
         out: set[int] = set()
+        if fp.old and fp.new == fp.old and fp.old.startswith("tests/fixtures/") and fp.old.endswith(".sql"):
+            # Every .sql fixture is read through tests/helpers._filter_comments,
+            # which drops blank lines and "--" comments before parsing.
+            old_text = self.text(fp.old)
+            if old_text is not None:
+                new_text = apply(old_text, fp)[0]
+
+                def filtered(t: str) -> str:
+                    return "\n".join(l for l in t.splitlines() if l and not l.startswith("--"))
+
+                if filtered(old_text) == filtered(new_text):
+                    return out
         for p in {fp.old, fp.new} - {None}:
             idx = m.reads.get(p)
             if idx is not None:
@@ -978,6 +995,10 @@ def fast_live(sel: "Selector", m: "Map", commit: str, chosen: list[dict]) -> lis
     at_import = any(lines & m.import_lines.get(path, set()) for path, lines in sel.touched.items())
     live = [t for t in chosen if t["id"] != TPCDS_EXEC]
     rest = [t for t in chosen if t["id"] == TPCDS_EXEC]
+    if not FAST_HEAVY and any(t["file"] in HEAVY_TEST_FILES for t in live):
+        return chosen
+    if not FAST_DATA and (at_import or class_data_change(sel, files)):
+        return chosen
     secs = sum(t["seconds"] for t in live)
     listing = pack_cost([(t["number"], t["seconds"]) for t in chosen])
     after = pack_cost([(t["number"], t["seconds"]) for t in rest])
