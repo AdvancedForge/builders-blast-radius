@@ -105,10 +105,17 @@ class Map:
         return self._by_prefix[prefix]
 
     def importers(self, path: str) -> set[int]:
+        """Tests that import `path`: their test module imports it, they ran a
+        line of it, or they used a class defined in it (dialect modules are
+        imported lazily, mid-test)."""
         files = [tf for tf, mods in self.closure.items() if mods is None or path in mods or tf == path]
         out = set()
         for tf in files:
             out |= self.prefix(tf + "::")
+        mod = path[:-3].replace("/", ".").removesuffix(".__init__") + ":"
+        for q, idx in self.classes.items():
+            if q.startswith(mod):
+                out.update(self.sets[idx])
         return out | self.file_any(path)
 
 
@@ -301,6 +308,36 @@ class Selector:
     def class_users(self, path: str, quals: list[str]) -> set[int] | None:
         return self.m.users(f"{module_name(path)}:{'.'.join(quals)}")
 
+    def method_reach(self, name: str) -> set[int] | None:
+        """Tests a new method `name` can reach: those that ran a same-named
+        method it may override, built the expression a `<key>_sql` generator
+        method is dispatched for, or ran a line naming it. None if unsure."""
+        out = self.runtime_reads(name)
+        if out is None:
+            return None
+        out = set(out)
+        for rel in self.m.lines:
+            if not rel.startswith("sqlglot/"):
+                continue
+            text = self.text(rel)
+            if text is None or f"def {name}(" not in text:
+                continue
+            for node in ast.walk(self.tree(rel)):
+                if isinstance(node, FUNC) and node.name == name:
+                    out |= self.m.span(rel, node.lineno, node.end_lineno)
+        if name.endswith("_sql"):
+            key = name[:-4]
+            hit = False
+            for q, idx in self.m.classes.items():
+                mod, _, qual = q.partition(":")
+                if mod.startswith("sqlglot.expressions") and qual.lower() == key:
+                    out |= self.m.s(idx); hit = True
+            if not hit and key not in ("", "sql"):
+                # a key no traced expression has: could still be dispatched for
+                # an expression built only outside the suite's traces
+                pass
+        return out
+
     def runtime_reads(self, name: str) -> set[int] | None:
         """Tests that ran a line reading attribute/name `name`, or None if any
         read happens outside a function (class creation, module import), where
@@ -333,6 +370,8 @@ class Selector:
                     out = None
                     break
                 st = stmts[-1]
+                if isinstance(st, FUNC) and start(st) <= i <= st.lineno and st.name == name:
+                    continue  # a definition, not a read
                 if i in self.m.import_lines.get(rel, ()):
                     out = None  # read while modules load (e.g. a metaclass): users unknown
                     break
@@ -529,6 +568,9 @@ class Selector:
         new_lines = new_text.split("\n")
         out: set[int] = set()
         for ln in removed:
+            code = old_lines[ln - 1].strip()
+            if not code or code.startswith("#"):
+                continue  # removing a blank or comment line changes nothing
             loc = self.at_line(path, old_tree, ln, self.key_names(old_lines[ln - 1]))
             self.locs.append(loc); out |= loc
         for k, n in added:
@@ -559,7 +601,14 @@ class Selector:
             quals = [x.name for x in nch[: ci + 1] if isinstance(x, ast.ClassDef)]
             fn_inside = any(isinstance(x, FUNC) for x in nch[:ci])
             existing = isinstance(member, FUNC) and self.has_method(old_tree, quals, member.name)
-            if not fn_inside and not existing:
+            if not fn_inside and not existing and isinstance(member, FUNC) and not path.startswith("tests/"):
+                users = self.class_users(path, quals)
+                if users is not None:
+                    reach = self.method_reach(member.name)
+                    if reach is not None:
+                        users = users & reach
+                    out |= users
+            elif not fn_inside and not existing:
                 users = self.class_users(path, quals)
                 if users is not None:
                     keys = names
