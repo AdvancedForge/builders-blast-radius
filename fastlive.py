@@ -140,7 +140,18 @@ def _own(code: types.CodeType):
             code.co_exceptiontable)
 
 
+_DATA_OPS_CACHE: dict = {}
+
+
 def data_ops(old_text: str, new_text: str):
+    """Cached: a pure function of the two texts, asked for several times per commit."""
+    key = (hash(old_text), hash(new_text), len(old_text), len(new_text))
+    if key not in _DATA_OPS_CACHE:
+        _DATA_OPS_CACHE[key] = _data_ops(old_text, new_text)
+    return _DATA_OPS_CACHE[key]
+
+
+def _data_ops(old_text: str, new_text: str):
     """Class-level data changes between two versions of a module, as
     [(class path, attr, op, key source, value source)], or None if anything
     else changed outside function bodies. op is "set" (a constant), or

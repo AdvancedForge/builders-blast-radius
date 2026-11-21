@@ -1445,6 +1445,11 @@ def families() -> dict[str, set[str]]:
     global _FAMILIES
     if _FAMILIES is not None:
         return _FAMILIES
+    try:  # precomputed at build time (tools/families.py); identical result
+        _FAMILIES = {d: set(v) for d, v in json.load(open(HERE / "families.json")).items()}
+        return _FAMILIES
+    except OSError:
+        pass
     base = (_ENTRIES or {}).get("__families__", {})
     imports: dict[str, set[str]] = {}
 
