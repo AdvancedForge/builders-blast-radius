@@ -1251,8 +1251,13 @@ def main() -> None:
     m = Map(MAP)
     sel = Selector(m)
     every = sorted(by_id.values(), key=lambda t: t["number"])
+    import resource as _res
+    def _cpu():
+        a, b = _res.getrusage(_res.RUSAGE_SELF), _res.getrusage(_res.RUSAGE_CHILDREN)
+        return a.ru_utime + a.ru_stime + b.ru_utime + b.ru_stime
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
+        _c0 = _cpu()
         try:
             text = patch.read_text("utf-8", errors="replace")
             sel.import_ok = False
@@ -1319,6 +1324,7 @@ def main() -> None:
             chosen = every
         workers = pack([(t["number"], t["seconds"]) for t in chosen])
         print(json.dumps({"commit": commit, "workers": workers}), flush=True)
+        log(f"{commit}: commit cpu {_cpu() - _c0:.2f}")
         log(f"{commit}: {len(chosen)} tests, {len(workers)} workers")
 
 
