@@ -451,6 +451,12 @@ class Selector:
             if ln < body_start:  # decorator, def line, signature
                 return m.span(path, f.lineno, f.end_lineno) | m.span(path, start(f), f.lineno)
             inner = [n for n in ch[inner_fn + 1:] if isinstance(n, ast.stmt)]
+            imported = m.import_lines.get(path, ())
+            if not names_hint and path.startswith("sqlglot/") and any(
+                    x in imported for x in range(body_start, f.end_lineno + 1)):
+                # This function runs while sqlglot is imported: breaking it can
+                # break every import.
+                raise Everything(f"import-time code {path}:{ln}")
             for n in inner:
                 if isinstance(n, COMPOUND) or isinstance(n, FUNC + (ast.ClassDef,)):
                     out |= m.span(path, n.lineno, max(n.lineno, header_end(n)))
@@ -561,6 +567,8 @@ class Selector:
         try:
             new_tree = ast.parse(new_text.encode("utf-8"))
         except (SyntaxError, ValueError):
+            if path.startswith("sqlglot/"):
+                raise Everything(f"syntax error in {path}")  # dialects load lazily from everywhere
             return m.importers(path) if fp.old else set()
         if not fp.old or old_text == "":
             return set()  # a new module nothing imports yet
