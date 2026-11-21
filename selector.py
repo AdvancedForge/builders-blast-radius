@@ -37,7 +37,9 @@ MAP = Path(os.environ.get("BR_MAP", HERE / "maps" / "map.json.gz"))
 LIVE = os.environ.get("BR_LIVE", "0") == "1"  # live proxies cost more CPU than they save
 # Small selections are run live instead of listed: ~0.6-1 s of CPU against the
 # 2 s a worker costs, and only tests that really fail are listed.
-SMALL = os.environ.get("BR_SMALL", "1") == "1"
+# Off by default: the scorer's CPU is ~3x slower than a dev box, which makes
+# a live run cost about what the worker it saves does.
+SMALL = os.environ.get("BR_SMALL", "0") == "1"
 # Importing these pulls in DuckDB and pandas and sets up process pools: a live
 # run costs 1.3-3 s of CPU, no better than listing.
 HEAVY_TEST_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
@@ -827,27 +829,49 @@ def fingerprint_unchanged(sel: "Selector", files: set[str]) -> bool:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def import_unchanged(sel: "Selector") -> bool:
-    """True if patched sqlglot imports, loads every dialect, and builds the
-    same import-time SQL objects as the pinned commit."""
+def import_changes(sel: "Selector") -> list[str] | None:
+    """Import patched sqlglot, load every dialect and compare the SQL objects
+    and dict shapes built at import with the pinned commit. Returns the
+    "module:Class.attr" entries that differ, or None if the import fails."""
     import shutil
     import subprocess
     import tempfile
 
     if not IMPORT_BASE.exists():
-        return False
+        return None
     root = Path(tempfile.mkdtemp(prefix="bri", dir="/tmp"))
     try:
         build_tree(SRC, root, sel.patched, sel.deleted)
         env = dict(os.environ, PYTHONPATH=str(root), PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1", HOME="/tmp")
         r = subprocess.run([sys.executable, str(HERE / "import_fp.py"), "check", str(IMPORT_BASE)], cwd=root,
-                           env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
-        return r.returncode == 0
+                           env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=LIVE_TIMEOUT)
+        if r.returncode != 0:
+            return None
+        return [l for l in r.stdout.decode().split("\n") if l]
     except Exception as e:  # noqa: BLE001
         log("import check failed:", type(e).__name__, e)
-        return False
+        return None
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def import_change_users(m: "Map", changes: list[str]) -> set[int] | None:
+    """Tests that use what changed at import: users of each changed class."""
+    out: set[int] = set()
+    for entry in changes:
+        mod, _, rest = entry.partition(":")
+        owner = rest.rsplit(".", 1)[0]
+        if not owner:  # a module-level object: every importer of the module
+            path = mod.replace(".", "/") + ".py"
+            if path not in m.lines:
+                path = mod.replace(".", "/") + "/__init__.py"
+            out |= m.importers(path)
+            continue
+        users = m.users(f"{mod}:{owner}")
+        if users is None:
+            return None
+        out |= users
+    return out
 
 
 def build_tree(src: Path, dst: Path, patched: dict[str, str], deleted: set[str]) -> None:
@@ -918,11 +942,15 @@ def main() -> None:
             try:
                 keys = sel.commit(text)
             except Everything as e:
-                if not str(e).startswith("import-time") or not live_allowed() or not import_unchanged(sel):
+                if not str(e).startswith("import-time") or not live_allowed():
                     raise
-                log(f"{commit}: import-time state unchanged, selecting normally")
+                changes = import_changes(sel)
+                extra = import_change_users(m, changes) if changes is not None else None
+                if extra is None:
+                    raise
+                log(f"{commit}: import-time changes {changes[:5]}{'...' if len(changes) > 5 else ''}")
                 sel.import_ok = True
-                keys = sel.commit(text)
+                keys = sel.commit(text) | extra
             plan = sel.proxy_plan(keys) if LIVE else {}
             if plan:
                 ids = [m.tests[p] for p in plan]

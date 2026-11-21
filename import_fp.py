@@ -3,7 +3,8 @@ dialect, and hash every SQL expression object held at module or class level
 (templates parsed at import) plus the keys of class-level dicts.
 
   import_fp.py base OUT     write the fingerprint of the tree on sys.path
-  import_fp.py check BASE   exit 0 if equal, 1 if different or import fails
+  import_fp.py check BASE   print the "module:Class.attr" entries that differ
+                            (one per line); exit 1 if the import fails
 """
 import hashlib
 import importlib
@@ -31,19 +32,20 @@ def fingerprint():
     for name in getattr(d, "DIALECTS", []):
         Dialect.get_or_raise(name.lower())
 
-    out = []
+    out = {}
 
     def note(where, value):
         if isinstance(value, Expr):
-            out.append(f"{where}={type(value).__name__}:{value.sql()}")
+            out[where] = f"{type(value).__name__}:{value.sql()}"
         elif isinstance(value, dict):
             exprs = [f"{k!r}:{v.sql()}" for k, v in value.items() if isinstance(v, Expr)]
-            out.append(f"{where}#keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else ""))
+            out[where] = f"keys={len(value)}" + ("|" + "|".join(sorted(exprs)) if exprs else "")
 
     seen = set()
     for mod in mods:
         for k, v in sorted(vars(mod).items()):
-            note(f"{mod.__name__}.{k}", v)
+            if not k.startswith("__"):
+                note(f"{mod.__name__}:.{k}", v)
             if inspect.isclass(v) and v.__module__ == mod.__name__ and id(v) not in seen:
                 seen.add(id(v))
                 stack = [v]
@@ -51,10 +53,10 @@ def fingerprint():
                     c = stack.pop()
                     for ck, cv in sorted(vars(c).items()):
                         if not ck.startswith("__"):
-                            note(f"{c.__module__}.{c.__qualname__}.{ck}", cv)
+                            note(f"{c.__module__}:{c.__qualname__}.{ck}", cv)
                         if inspect.isclass(cv) and cv.__module__ == mod.__name__ and id(cv) not in seen:
                             seen.add(id(cv)); stack.append(cv)
-    return hashlib.sha1("\n".join(sorted(out)).encode()).hexdigest()
+    return {k: hashlib.sha1(v.encode()).hexdigest()[:16] for k, v in out.items()}
 
 
 if __name__ == "__main__":
@@ -67,4 +69,8 @@ if __name__ == "__main__":
     if mode == "base":
         json.dump(fp, open(path, "w"))
         sys.exit(0)
-    sys.exit(0 if json.load(open(path)) == fp else 1)
+    base = json.load(open(path))
+    for k in sorted(set(base) | set(fp)):
+        if base.get(k) != fp.get(k):
+            print(k)
+    sys.exit(0)
