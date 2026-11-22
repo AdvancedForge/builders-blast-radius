@@ -499,6 +499,22 @@ def _apply_ops(module, ops):
         if op in ("addmethod", "delmethod"):
             _method_op(module, cls, attr, op, vsrc)
             continue
+        if op == "envexec":
+            # Module-level dict entries (executor ENV): run the new module
+            # source in a fresh namespace and move the changed entries into
+            # the live dict, which every importer shares.
+            fresh_ns = {"__name__": module.__name__, "__file__": getattr(module, "__file__", None),
+                        "__builtins__": __builtins__}
+            exec(compile(vsrc, getattr(module, "__file__", None) or "<env>", "exec"), fresh_ns)
+            d, fresh = getattr(module, attr), fresh_ns[attr]
+            if type(d) is not dict or type(fresh) is not dict:
+                raise RuntimeError(f"{attr} is not a plain dict")
+            for key in ksrc:
+                if key in fresh:
+                    d[key] = fresh[key]
+                else:
+                    d.pop(key, None)
+            continue
         ns = dict(vars(module))
         ns.update({k: v for k, v in vars(cls).items()})
         if op == "set":

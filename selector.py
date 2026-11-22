@@ -891,6 +891,7 @@ class Selector:
                     self.no_live = self.no_live or not escape_free(outer)
                     self.want_vals = True  # fast_live then needs every built value compared
                     self.no_fp = True
+                    self.no_fp_paths.add(path)
                     self.needs_import_check = True
                     self.import_deep_users = True
                     return m.span(path, start(outer), outer.end_lineno or outer.lineno)
@@ -1266,6 +1267,7 @@ class Selector:
         self.needs_import_check = False
         self.no_live = False
         self.no_fp = False
+        self.no_fp_paths: set[str] = set()
         self.want_vals = False
         self.import_failed = False
         self.import_deep_users = False
@@ -1797,7 +1799,7 @@ def pack_cost(tests: list[tuple[int, float]]) -> float:
     return max(sum(sec[n] for n in w) for w in workers) + WORKER_COST * len(workers)
 
 
-def tpcds_queries(sel: "Selector") -> int | None:
+def tpcds_queries(sel: "Selector", only: set[str] | None = None) -> int | None:
     """Bitmask of TPC-DS queries whose processing runs a function the patch
     changes, or None if some change is outside a function (then every query
     may be affected)."""
@@ -1807,6 +1809,8 @@ def tpcds_queries(sel: "Selector") -> int | None:
             _tpcds_lines = json.load(fh)
     mask = 0
     for path, lines in sel.touched.items():
+        if only is not None and path not in only:
+            continue
         tree = sel.tree(path)
         per = _tpcds_lines.get(path, {})
         for ln in lines:
@@ -1990,7 +1994,7 @@ def _changed_old_lines(old: str, new: str) -> set[int]:
     return out
 
 
-def exec_tpcds_queries(sel: "Selector") -> tuple[list[int], bool] | None:
+def exec_tpcds_queries(sel: "Selector", skip: set[str] = frozenset()) -> tuple[list[int], bool] | None:
     """Indices (among executed queries) of the TPC-DS queries whose run on
     the real tables calls a function the patch changes (functions called
     while importing or loading the tables count for every query) or looks
@@ -2015,6 +2019,8 @@ def exec_tpcds_queries(sel: "Selector") -> tuple[list[int], bool] | None:
     try:
         fastlive.setup(str(SRC))
         for path, text in sel.patched.items():
+            if path in skip:
+                continue  # judged by the caller (fingerprint)
             old = sel.text(path)
             if old is None:
                 return None
@@ -2076,7 +2082,7 @@ def fingerprint_diff(sel: "Selector", files: set[str]) -> list[int] | None:
     if not TPCDS_BASE.exists() or any(f.startswith(DATA_TIME) or not f.endswith(".py") for f in files):
         return None
     try:
-        queries = tpcds_queries(sel)
+        queries = tpcds_queries(sel, files)
     except Exception as e:  # noqa: BLE001
         log("tpcds query map failed:", type(e).__name__, e)
         queries = None
@@ -2314,16 +2320,32 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
 
     files = set(sel.patched) | sel.deleted
     try:
-        if sel.deleted or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
+        if sel.deleted:
+            return False
+        # test edits test_execute_tpcds cannot see
+        files = {f for f in files if not (f.startswith("tests/") and sel.text(f) is not None
+                                          and tpcds_test_untouched(f, sel.text(f), sel.patched[f]))}
+        if not files or not all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
             return False
         fastlive.setup(str(SRC))
-        swaps, data = [], []
+        swaps, data, env_ops = [], [], []
         for f in files:
             old = sel.text(f)
-            ops = fastlive.data_ops(old, sel.patched[f]) if old is not None else None
+            new = sel.patched[f]
+            if f == ENV_FILE and old is not None:
+                # ENV entries: proved to only build function objects
+                # (env_entry_changes); swapped into the live dict in the child
+                r = env_entry_changes(old, new)
+                if r is None:
+                    return False
+                neutral, keys = r
+                if neutral != new:
+                    env_ops.append((module_name(f), [((), "ENV", "envexec", sorted(keys), new)]))
+                    new = neutral
+            ops = fastlive.data_ops(old, new) if old is not None else None
             if ops is None:
                 return False
-            sw = fastlive.swaps_for(f, old, sel.patched[f], allow_bodies=True)  # data_ops accounted for every class-level difference
+            sw = fastlive.swaps_for(f, old, new, allow_bodies=True)  # data_ops accounted for every class-level difference
             if sw is None:
                 return False
             swaps += sw
@@ -2338,6 +2360,7 @@ def tpcds_queries_pass(sel: "Selector", commit: str, diff: list[int]) -> bool:
                 return False
         if not fastlive.import_tests({"tests/test_executor.py"}):
             return False
+        data = data + env_ops
         passed = fastlive.run([TPCDS_EXEC], swaps, LIVE_TIMEOUT, data, tpcds=diff, tpc_cache=tpc_cache_ok(sel))
         return passed is not None and TPCDS_EXEC in passed
     except Exception as e:  # noqa: BLE001
@@ -2516,18 +2539,30 @@ def main() -> None:
                 if full - rest < 2.5:
                     tp = None
             files = set(sel.patched) | sel.deleted
-            if FP_ON and tp is not None and live_allowed() and executor_only(files):
+            exec_files = {f for f in files if f.startswith("sqlglot/executor/")}
+            others = {f for f in files if not f.startswith(("sqlglot/executor/", "tests/"))}
+            if FP_ON and tp is not None and live_allowed() and exec_files and not sel.deleted \
+                    and all(f.endswith(".py") for f in files):
                 # The executor runs on the data, which the fingerprint never
                 # sees: use which queries reach the changed functions or ENV
-                # entries on the real tables, and run just those.
-                r = exec_tpcds_queries(sel)
+                # entries on the real tables, and run just those. Other
+                # sqlglot files must leave every query's transpilation, plan
+                # and generated code as it was (the fingerprint).
+                r = exec_tpcds_queries(sel, skip=others)
                 qs, swappable = r if r is not None else (None, False)
                 if qs is not None:
-                    log(f"{commit}: TPC-DS executor queries {len(qs)}")
-                if qs == []:
+                    log(f"{commit}: TPC-DS executor queries {len(qs)}" + (f", others {sorted(others)}" if others else ""))
+                if qs == [] and not others:
                     keys.discard(tp)
                     log(f"{commit}: no TPC-DS query runs the changed executor code, dropping {TPCDS_EXEC}")
-                elif qs is not None and swappable and not (sel.no_live or sel.no_fp) \
+                elif qs == [] and not any(f.startswith(DATA_TIME) for f in others) \
+                        and not (sel.no_fp_paths & others):
+                    diff = fingerprint_diff(sel, others)
+                    log(f"{commit}: TPC-DS fingerprint of {sorted(others)}: {diff}")
+                    if diff == []:
+                        keys.discard(tp)
+                        log(f"{commit}: executor code unreached and fingerprint unchanged, dropping {TPCDS_EXEC}")
+                elif qs and not others and not sel.no_live \
                         and SCORER_CPU * (1.5 + 0.45 * len(qs)) < 0.8 * (full - rest) \
                         and tpcds_queries_pass(sel, commit, qs):
                     keys.discard(tp)
@@ -2536,7 +2571,13 @@ def main() -> None:
             if sel.no_live or sel.no_fp:
                 tp = None  # import-time code changed: the data-free fingerprint can miss its effect
             if FP_ON and tp is not None and live_allowed():
-                diff = fingerprint_diff(sel, files)
+                # test edits test_execute_tpcds cannot see leave the fingerprint to the rest
+                fp_files = {f for f in files if not (f.startswith("tests/") and f not in sel.deleted
+                                                     and sel.text(f) is not None and f in sel.patched
+                                                     and tpcds_test_untouched(f, sel.text(f), sel.patched[f]))}
+                if fp_files != files:
+                    log(f"{commit}: TPC-DS fingerprint ignores test edits {sorted(files - fp_files)}")
+                diff = fingerprint_diff(sel, fp_files) if fp_files else None
                 if diff == []:
                     keys.discard(tp)
                     log(f"{commit}: TPC-DS fingerprint unchanged, dropping {TPCDS_EXEC}")
